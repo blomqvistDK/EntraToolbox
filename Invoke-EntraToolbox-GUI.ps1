@@ -218,6 +218,15 @@ function New-EntraButton {
     return $button
 }
 
+function Update-EntraCheckListSummary {
+    param($Panel)
+    $state = $Panel.Tag
+    $selected = @($Panel.Children | Where-Object { $_.IsChecked } | ForEach-Object { [string]$_.Content })
+    $state.Summary.Text = if ($selected.Count) { $selected -join ', ' } else { $state.Placeholder }
+    $state.Summary.Opacity = if ($selected.Count) { 1 } else { 0.7 }
+    $state.Toggle.ToolTip = if ($selected.Count) { "Selected: $($selected -join ', ')" } else { $state.Tip }
+}
+
 function Add-EntraField {
     param($Page, [string]$Key, [string]$Label, [string]$Kind = 'Text', [string[]]$Options, [string]$Default, [string]$Tip)
     $field = [Windows.Controls.StackPanel]::new()
@@ -236,6 +245,63 @@ function Add-EntraField {
     } elseif ($Kind -eq 'Check') {
         $inputControl = [Windows.Controls.CheckBox]::new()
         $inputControl.Content = $Label
+    } elseif ($Kind -eq 'CheckList') {
+        # Multi-select dropdown: a ComboBox-styled toggle opening a popup of checkboxes (ComboBox itself closes on every click).
+        $inputControl = [Windows.Controls.StackPanel]::new()
+        foreach ($option in $Options) {
+            $check = [Windows.Controls.CheckBox]::new()
+            $check.Content = $option
+            $check.Margin = [Windows.Thickness]::new(9,7,9,7)
+            $check.Padding = [Windows.Thickness]::new(6,0,0,0)
+            $check.Tag = $inputControl
+            $check.Add_Checked({ param($sender,$eventArgs) Update-EntraCheckListSummary $sender.Tag })
+            $check.Add_Unchecked({ param($sender,$eventArgs) Update-EntraCheckListSummary $sender.Tag })
+            [void]$inputControl.Children.Add($check)
+        }
+        $toggle = [Windows.Markup.XamlReader]::Parse(@'
+<ToggleButton xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" MinHeight="32" HorizontalContentAlignment="Stretch">
+ <ToggleButton.Template><ControlTemplate TargetType="ToggleButton">
+  <Border Background="{DynamicResource InputBgBrush}" BorderBrush="{DynamicResource BorderBrush2}" BorderThickness="1" CornerRadius="3">
+   <Grid><TextBlock Text="&#xE70D;" FontFamily="Segoe MDL2 Assets" HorizontalAlignment="Right" Margin="0,0,10,0" VerticalAlignment="Center" Foreground="{DynamicResource TextBrush}"/>
+   <ContentPresenter Margin="9,5,30,5" VerticalAlignment="Center"/></Grid>
+  </Border>
+ </ControlTemplate></ToggleButton.Template>
+</ToggleButton>
+'@)
+        $summary = [Windows.Controls.TextBlock]::new()
+        $summary.TextTrimming = 'CharacterEllipsis'
+        $summary.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'TextBrush')
+        $toggle.Content = $summary
+        $toggle.ToolTip = $Tip
+        [Windows.Automation.AutomationProperties]::SetName($toggle, $Label)
+        $popupBorder = [Windows.Controls.Border]::new()
+        $popupBorder.BorderThickness = [Windows.Thickness]::new(1)
+        $popupBorder.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'InputBgBrush')
+        $popupBorder.SetResourceReference([Windows.Controls.Border]::BorderBrushProperty, 'BorderBrush2')
+        $popupScroll = [Windows.Controls.ScrollViewer]::new()
+        $popupScroll.MaxHeight = 300
+        $popupScroll.VerticalScrollBarVisibility = 'Auto'
+        $popupScroll.Content = $inputControl
+        $popupBorder.Child = $popupScroll
+        $minWidthBinding = [Windows.Data.Binding]::new('ActualWidth'); $minWidthBinding.Source = $toggle
+        [void]$popupBorder.SetBinding([Windows.FrameworkElement]::MinWidthProperty, $minWidthBinding)
+        $popup = [Windows.Controls.Primitives.Popup]::new()
+        $popup.PlacementTarget = $toggle
+        $popup.Placement = 'Bottom'
+        $popup.StaysOpen = $false
+        $popup.AllowsTransparency = $true
+        $popup.Child = $popupBorder
+        $popup.Tag = $toggle
+        $openBinding = [Windows.Data.Binding]::new('IsChecked'); $openBinding.Source = $toggle; $openBinding.Mode = 'TwoWay'
+        [void]$popup.SetBinding([Windows.Controls.Primitives.Popup]::IsOpenProperty, $openBinding)
+        # While open, the outside click that closes the popup must not immediately re-toggle it.
+        $popup.Add_Opened({ param($sender,$eventArgs) $sender.Tag.IsHitTestVisible = $false })
+        $popup.Add_Closed({ param($sender,$eventArgs) $sender.Tag.IsHitTestVisible = $true })
+        $popupBorder.Tag = $toggle
+        $popupBorder.Add_PreviewKeyDown({ param($sender,$eventArgs) if ($eventArgs.Key -eq 'Escape') { $sender.Tag.IsChecked = $false; [void]$sender.Tag.Focus(); $eventArgs.Handled = $true } })
+        $toggle.Add_IsEnabledChanged({ param($sender,$eventArgs) if (-not $sender.IsEnabled) { $sender.IsChecked = $false } })
+        $inputControl.Tag = @{ Toggle = $toggle; Summary = $summary; Popup = $popup; Tip = $Tip; Placeholder = $(if ($Default) { $Default } else { 'None selected' }) }
+        Update-EntraCheckListSummary $inputControl
     } else {
         $inputControl = [Windows.Controls.TextBox]::new()
         $inputControl.Text = $Default
@@ -268,6 +334,9 @@ function Add-EntraField {
         })
         [void]$fileGrid.Children.Add($inputControl); [void]$fileGrid.Children.Add($browse)
         [void]$field.Children.Add($fileGrid)
+    } elseif ($Kind -eq 'CheckList') {
+        [void]$field.Children.Add($inputControl.Tag.Toggle)
+        [void]$field.Children.Add($inputControl.Tag.Popup)
     } else { [void]$field.Children.Add($inputControl) }
     [void]$Page.Form.Children.Add($field)
     $Page.Controls[$Key] = $inputControl
@@ -519,6 +588,9 @@ function Get-EntraInvocation {
                 'All logged-on users' { 'All' }
                 default { throw 'Choose latest, most, or all logged-on users.' }
             }
+            $selectedAttributes = @($controls.ExtensionAttributeNumbers.Children | Where-Object { $_.IsChecked } |
+                ForEach-Object { [int]([string]$_.Content -replace '^extensionAttribute', '') })
+            if ($selectedAttributes.Count) { $parameters.ExtensionAttributeNumbers = [int[]]$selectedAttributes }
         }
         'Attributes' {
             if ($controls.Source.SelectedItem -eq 'CSV file') {
@@ -980,7 +1052,12 @@ function Add-EntraPage {
         $page = $sender.Tag
         foreach ($key in $page.Controls.Keys) {
             $control = $page.Controls[$key]
-            switch ($page.Defaults[$key].Kind) { 'Choice' { $control.SelectedIndex=0 } 'Check' { $control.IsChecked=$false } default { $control.Text=$page.Defaults[$key].Value } }
+            switch ($page.Defaults[$key].Kind) {
+                'Choice' { $control.SelectedIndex=0 }
+                'Check' { $control.IsChecked=$false }
+                'CheckList' { foreach ($check in $control.Children) { $check.IsChecked=$false }; $control.Tag.Toggle.IsChecked=$false }
+                default { $control.Text=$page.Defaults[$key].Value }
+            }
         }
         $page.Results.Clear(); $page.Filter.Text=''; $page.LastOutput=$null; $page.OpenOutput.IsEnabled=$false; $page.Status.Text='Ready'
         if ($page.Id -eq 'DeviceCleanup') { $page.Controls.Preview.IsChecked = $true }
@@ -1049,6 +1126,7 @@ Add-EntraField $primary 'OutputPath' 'Entra import CSV output' 'Save' -Default (
 $lastUser = Add-EntraPage -Id 'LastUser' -Section 'User-Device Affinity' -Title 'Device Last User(s)' -Description 'Intune managed devices and selected logged-on user details' -RelativePath 'Get-DevicesLastUser.ps1' -Scopes @('DeviceManagementManagedDevices.Read.All','DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementConfiguration.Read.All','DeviceManagementConfiguration.ReadWrite.All','User.Read.All')
 Add-EntraField $lastUser 'Source' 'Device source' 'Choice' @('Choose a source','Device names','Entra group','CSV file','All devices')
 Add-EntraField $lastUser 'UserMode' 'User selection' 'Choice' @('Latest logged-on user','Most logged-on user(s)','All logged-on users') -Tip 'Latest: newest logon. Most: count userId occurrences in usersLoggedOn and return all tied winners. All: each distinct logged-on user, newest first. One row per device/user; primary-user fallback when no logged-on userId is available.'
+Add-EntraField $lastUser 'ExtensionAttributeNumbers' 'User extension attribute columns (optional)' 'CheckList' @(1..15 | ForEach-Object { "extensionAttribute$_" }) -Default 'Choose attributes' -Tip 'Select columns for the next run and CSV exports. Values come from each resolved user; unset attributes are blank.'
 Add-EntraField $lastUser 'OutputPath' 'Report CSV output' 'Save' -Default (Join-Path $desktop "intune_device_last_logged_on_user_$(Get-Date -Format 'yyyy-MM-dd').csv")
 Add-EntraField $lastUser 'DeviceName' 'Device names' 'Lines' -Tip 'One Intune managed device name per line.'
 Add-EntraField $lastUser 'GroupNameOrId' 'Entra group name or ID' -Tip 'Must resolve to exactly one Entra group. Only direct device members are included.'

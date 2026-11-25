@@ -34,6 +34,10 @@ occurrences in that array and returns every user tied for the highest count.
 All returns each distinct userId once. Most and All order users by their newest
 logon, newest first. Array occurrences are not complete historical sign-in counts.
 All modes fall back to the primary user when no usable logged-on userId exists.
+.PARAMETER ExtensionAttributeNumbers
+Optional extension attribute numbers (1-15) to append as report columns.
+Values come from each resolved user's onPremisesExtensionAttributes. Unset
+values are blank; lookup failures retain the row and its lookup diagnostics.
 .PARAMETER SkipGraphConnect
 Require an existing Graph session instead of signing in.
 .PARAMETER PassThru
@@ -73,6 +77,11 @@ Returns every user tied for the most userId occurrences in usersLoggedOn.
 .\Get-DevicesLastUser.ps1 -DeviceName PC1 -UserMode All
 
 Returns one row per distinct logged-on user, newest logon first.
+
+.EXAMPLE
+.\Get-DevicesLastUser.ps1 -DeviceName PC1 -ExtensionAttributeNumbers 1,5,15
+
+Appends extensionAttribute1, extensionAttribute5 and extensionAttribute15.
 #>
 [CmdletBinding(DefaultParameterSetName = 'AllDevices')]
 param(
@@ -88,9 +97,13 @@ param(
     [string]$OutputPath = ".\intune_device_last_logged_on_user_$(Get-Date -Format 'yyyy-MM-dd').csv",
     [ValidateSet('Latest', 'Most', 'All')]
     [string]$UserMode = 'Latest',
+    [ValidateRange(1, 15)]
+    [int[]]$ExtensionAttributeNumbers = @(),
     [switch]$SkipGraphConnect,
     [switch]$PassThru
 )
+
+$extensionAttributeNames = @($ExtensionAttributeNumbers | Sort-Object -Unique | ForEach-Object { "extensionAttribute$_" })
 
 function Get-GraphPagedCollection {
     param(
@@ -465,9 +478,9 @@ function Get-UserInfo {
 
     if ($Cache.ContainsKey($normalizedUserId)) {
         return [PSCustomObject]@{
-            UserInfo      = $Cache[$normalizedUserId]
+            UserInfo      = $Cache[$normalizedUserId].UserInfo
             Error         = $null
-            ExtendedError = $null
+            ExtendedError = $Cache[$normalizedUserId].ExtendedError
             LookupPhase   = 'Cached'
         }
     }
@@ -475,6 +488,11 @@ function Get-UserInfo {
     $coreUserUriSelected = "https://graph.microsoft.com/v1.0/users/${normalizedUserId}?`$select=id,displayName,userPrincipalName"
     $coreUserUriFallback = "https://graph.microsoft.com/v1.0/users/$normalizedUserId"
     $extendedUserUri = "https://graph.microsoft.com/v1.0/users/${normalizedUserId}?`$select=jobTitle,companyName,officeLocation"
+    $extendedProperties = @('jobTitle', 'companyName', 'officeLocation')
+    if ($extensionAttributeNames.Count) {
+        $extendedUserUri += ',onPremisesExtensionAttributes'
+        $extendedProperties += 'onPremisesExtensionAttributes'
+    }
     $lastErrorDetails = $null
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
@@ -489,11 +507,16 @@ function Get-UserInfo {
             }
 
             $extendedErrorDetails = $null
+            foreach ($extendedProperty in $extendedProperties) {
+                if (-not $userInfo.PSObject.Properties[$extendedProperty]) {
+                    $userInfo | Add-Member -NotePropertyName $extendedProperty -NotePropertyValue $null
+                }
+            }
 
             try {
                 $extendedUserInfo = Invoke-MgGraphRequest -Method GET -Uri $extendedUserUri -OutputType PSObject
                 # Always add the properties; Graph omits null ones and strict mode fails on missing members.
-                foreach ($extendedProperty in 'jobTitle', 'companyName', 'officeLocation') {
+                foreach ($extendedProperty in $extendedProperties) {
                     $extendedPropertyInfo = $extendedUserInfo.PSObject.Properties[$extendedProperty]
                     $extendedValue = if ($extendedPropertyInfo) { $extendedPropertyInfo.Value } else { $null }
                     $userInfo | Add-Member -NotePropertyName $extendedProperty -NotePropertyValue $extendedValue -Force
@@ -509,7 +532,7 @@ function Get-UserInfo {
                 Write-Verbose "Extended user profile lookup failed for id '$normalizedUserId': $extendedErrorSummary"
             }
 
-            $Cache[$normalizedUserId] = $userInfo
+            $Cache[$normalizedUserId] = @{ UserInfo = $userInfo; ExtendedError = $extendedErrorDetails }
 
             return [PSCustomObject]@{
                 UserInfo      = $userInfo
@@ -614,6 +637,7 @@ $report = foreach ($device in $devices) {
         $officeLocation = $null
         $lookupErrorMessage = $null
         $lookupPhase = $null
+        $userInfo = $null
 
         if ($userId) {
             $userLookupResult = Get-UserInfo -UserId $userId -Cache $userCache
@@ -638,12 +662,11 @@ $report = foreach ($device in $devices) {
                         $userLookupResult.ExtendedError.Message
                     }
 
-                    if ($jobTitle -or $companyName -or $officeLocation) {
-                        $lookupErrorMessage = $extendedLookupErrorMessage
-                    } else {
-                        $lookupErrorMessage = $extendedLookupErrorMessage
-                    }
+                    $lookupErrorMessage = $extendedLookupErrorMessage
                     $lookupPhase = 'ExtendedLookupFailed'
+                    if ($extensionAttributeNames.Count) {
+                        Write-Warning "Extended user profile lookup failed for '$userId' on device '$($device.deviceName)': $extendedLookupErrorMessage"
+                    }
                 }
             } elseif ($userSource -eq 'UsersLoggedOn') {
                 $resolutionStatus = 'UsersLoggedOnLookupFailed'
@@ -679,7 +702,7 @@ $report = foreach ($device in $devices) {
 
         Write-Host "[$counter/$($devices.Count)] Device: $($device.deviceName) | Model: $($device.model) | User: $($userUpn) | Display Name: $($userDisplayName) | Source: $userSource | Status: $resolutionStatus | Title: $jobTitle" -ForegroundColor Yellow
 
-        [PSCustomObject]@{
+        $row = [ordered]@{
             DeviceId           = $device.id
             DeviceName         = $device.deviceName
             Manufacturer       = $device.manufacturer
@@ -698,6 +721,18 @@ $report = foreach ($device in $devices) {
             LastLoggedOnUserId = $lastLoggedOnUserId
             PrimaryUserId      = $primaryUserId
         }
+        foreach ($attributeName in $extensionAttributeNames) {
+            $attributeValue = $null
+            if ($userInfo) {
+                $attributesProperty = $userInfo.PSObject.Properties['onPremisesExtensionAttributes']
+                if ($attributesProperty -and $attributesProperty.Value) {
+                    $attributeProperty = $attributesProperty.Value.PSObject.Properties[$attributeName]
+                    if ($attributeProperty) { $attributeValue = $attributeProperty.Value }
+                }
+            }
+            $row[$attributeName] = $attributeValue
+        }
+        [PSCustomObject]$row
     }
 }
 

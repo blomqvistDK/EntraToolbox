@@ -217,6 +217,40 @@ $requirements = Get-EntraRequirements $lastPage $mapping.Parameters
 Assert-EntraTest ($mapping.Parameters.GroupNameOrId -eq 'Device Group' -and $lastPage.Fields.GroupNameOrId.Visibility -eq 'Visible') 'Device Last User accepts an Entra group name in the GUI'
 Assert-EntraTest ('Device.Read.All' -in $requirements.Scopes -and 'Group.Read.All' -in $requirements.Scopes -and 'GroupMember.Read.All' -in $requirements.Scopes) 'Device Last User requests group/device scopes only for group input'
 Assert-EntraTest ($lastPage.Navigation.Content -eq 'Device Last User(s)' -and $mapping.Parameters.UserMode -eq 'Latest') 'Device Last User(s) defaults to latest user selection'
+$attributeChecks = $lastPage.Controls.ExtensionAttributeNumbers.Children
+$attributeState = $lastPage.Controls.ExtensionAttributeNumbers.Tag
+Assert-EntraTest ($attributeChecks.Count -eq 15 -and ($attributeChecks.Content -join ',') -eq ((1..15 | ForEach-Object { "extensionAttribute$_" }) -join ',') -and -not $mapping.Parameters.ContainsKey('ExtensionAttributeNumbers')) 'All 15 optional attribute checkboxes start unselected and omit the parameter'
+Assert-EntraTest ($attributeState.Toggle -is [Windows.Controls.Primitives.ToggleButton] -and -not $attributeState.Popup.IsOpen -and $attributeState.Summary.Text -eq 'Choose attributes') 'Attribute selector is a closed dropdown showing a placeholder'
+$attributeChecks[0].IsChecked = $true
+$attributeChecks[4].IsChecked = $true
+$attributeChecks[14].IsChecked = $true
+$mapping = Get-EntraInvocation $lastPage
+Assert-EntraTest (($mapping.Parameters.ExtensionAttributeNumbers -join ',') -eq '1,5,15') 'Multiple attribute selections map to numeric script parameters'
+Assert-EntraTest ($attributeState.Summary.Text -eq 'extensionAttribute1, extensionAttribute5, extensionAttribute15' -and $attributeState.Toggle.ToolTip -like '*extensionAttribute15*') 'Dropdown summary lists the selected attributes in order'
+$lastPage.Navigation.IsChecked = $true
+$ui.Window.UpdateLayout()
+$attributeState.Toggle.IsChecked = $true
+# Popup opening waits for the deferred Loaded event, so let the dispatcher run.
+$attributeFrame = [Windows.Threading.DispatcherFrame]::new()
+[void]$ui.Window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [Action]{ $attributeFrame.Continue = $false })
+[Windows.Threading.Dispatcher]::PushFrame($attributeFrame)
+$ui.Window.UpdateLayout()
+Assert-EntraTest ($attributeState.Popup.IsOpen) 'Opening the dropdown shows the attribute list'
+$attributeChecks[1].IsChecked = $true
+Assert-EntraTest ($attributeState.Popup.IsOpen -and $attributeState.Summary.Text -like '*extensionAttribute2*') 'Checking an attribute keeps the dropdown open for further selections'
+$attributeChecks[1].IsChecked = $false
+$popupScroll = $attributeState.Popup.Child.Child
+foreach ($check in $attributeChecks) {
+    $check.BringIntoView()
+    $popupScroll.UpdateLayout()
+    $checkPosition = $check.TranslatePoint([Windows.Point]::new(0,0),$popupScroll)
+    Assert-EntraTest ($check.ActualWidth -gt 0 -and $checkPosition.Y -ge -1 -and ($checkPosition.Y + $check.ActualHeight) -le ($popupScroll.ActualHeight + 1)) "$($check.Content) remains reachable in the dropdown list"
+}
+Assert-EntraTest ($popupScroll.ActualHeight -le 300) 'Dropdown list height is bounded'
+Set-EntraBusy $true
+Assert-EntraTest (-not $attributeState.Toggle.IsEnabled -and -not $attributeState.Popup.IsOpen) 'Attribute dropdown is disabled and closed while an operation is running'
+Set-EntraBusy $false
+$attributeState.Toggle.IsChecked = $true
 foreach ($mode in @{'Latest logged-on user'='Latest'; 'Most logged-on user(s)'='Most'; 'All logged-on users'='All'}.GetEnumerator()) {
     $lastPage.Controls.UserMode.SelectedItem = $mode.Key
     $mapping = Get-EntraInvocation $lastPage
@@ -224,6 +258,12 @@ foreach ($mode in @{'Latest logged-on user'='Latest'; 'Most logged-on user(s)'='
 }
 $lastPage.Reset.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
 Assert-EntraTest ($lastPage.Controls.UserMode.SelectedItem -eq 'Latest logged-on user') 'Device-user reset restores Latest selection'
+Assert-EntraTest (@($attributeChecks | Where-Object { $_.IsChecked }).Count -eq 0 -and $attributeState.Summary.Text -eq 'Choose attributes' -and -not $attributeState.Popup.IsOpen) 'Device-user reset clears every attribute selection and closes the dropdown'
+$lastPage.Navigation.IsChecked = $true
+$ui.Window.UpdateLayout()
+Assert-EntraTest ($attributeState.Toggle.ActualHeight -le 40 -and $lastPage.Table.ActualHeight -ge $lastPage.Table.MinHeight) 'Attribute dropdown takes a single row while retaining the output area'
+$lastPage.FormScroll.ScrollToTop()
+$primaryPage.Navigation.IsChecked = $true
 $lastPage.Controls.Source.SelectedItem = 'Choose a source'
 $attributePage.Controls.UserPrincipalName.Text = 'user@example.test'
 $attributePage.Controls.Action.SelectedItem = 'Clear'
@@ -353,11 +393,26 @@ function Invoke-MgGraphRequest {
             if ($Matches[1] -ne 'managed-1') { throw 'Response status code does not indicate success: NotFound (Not Found).' }
             return $device
         }
-        return [pscustomobject]@{ value=@($device); '@odata.nextLink'=$null }
+        $mockDevices = @($device)
+        if ($global:EntraMockState['RepeatLastUserDevice']) {
+            $secondDevice = $device | Select-Object *
+            $secondDevice.id = 'managed-2'
+            $secondDevice.deviceName = 'TEST-PC-2'
+            $mockDevices += $secondDevice
+        }
+        return [pscustomobject]@{ value=$mockDevices; '@odata.nextLink'=$null }
     }
     if ($Uri -match '/v1\.0/users/([^?]+)') {
         $requestedUserId = $Matches[1]
+        if ($global:EntraMockState.ContainsKey('LastUserRequests')) { $global:EntraMockState.LastUserRequests.Add([string]$Uri) }
         if ($requestedUserId -in $global:EntraMockState.FailedUserIds) { throw "User lookup denied for $requestedUserId" }
+        if ($Uri -like '*onPremisesExtensionAttributes*') {
+            if ($requestedUserId -in $global:EntraMockState['FailedAttributeUserIds']) { throw "Attribute lookup denied for $requestedUserId" }
+            if ($global:EntraMockState.LastUserAttributes.ContainsKey($requestedUserId)) {
+                return [pscustomobject]@{ onPremisesExtensionAttributes=$global:EntraMockState.LastUserAttributes[$requestedUserId] }
+            }
+            return [pscustomobject]@{}
+        }
         if ($Uri -notlike '*jobTitle*' -and $global:EntraMockState.ContainsKey('LastUserProfiles') -and $global:EntraMockState.LastUserProfiles.ContainsKey($requestedUserId)) {
             return $global:EntraMockState.LastUserProfiles[$requestedUserId]
         }
@@ -612,6 +667,78 @@ try {
     $bytes = [IO.File]::ReadAllBytes($lastCsv)
     Assert-EntraTest ($lastRows.Count -eq 1 -and $lastRows[0].ResolutionStatus -eq 'PrimaryUserResolved') 'Last-user typed result and absent extended properties'
     Assert-EntraTest ($bytes.Length -gt 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) 'Last-user CSV preserves UTF8 BOM'
+    $baseLastUserColumns = 'DeviceId,DeviceName,Manufacturer,Model,ResolvedUserId,ResolvedUserSource,ResolutionStatus,LookupPhase,LookupError,UserDisplayName,UserPrincipalName,JobTitle,CompanyName,OfficeLocation,UserSource,LastLoggedOnUserId,PrimaryUserId'
+    Assert-EntraTest (($lastRows[0].PSObject.Properties.Name -join ',') -eq $baseLastUserColumns) 'No selection preserves the exact existing last-user schema'
+    try {
+        $global:EntraMockState.LastUserRequests = [Collections.Generic.List[string]]::new()
+        $global:EntraMockState.LastUserAttributes = @{
+            'user-1'=[pscustomobject]@{ extensionAttribute1='Primary'; extensionAttribute5=''; extensionAttribute15='Fifteen' }
+            'user-2'=[pscustomobject]@{ extensionAttribute1='Second'; extensionAttribute15='Other' }
+            'user-3'=$null
+        }
+        $defaultRows = @(& $lastPage.Path -DeviceName 'TEST-PC' -OutputPath $lastCsv -SkipGraphConnect -PassThru)
+        Assert-EntraTest (@($global:EntraMockState.LastUserRequests | Where-Object { $_ -like '*onPremisesExtensionAttributes*' }).Count -eq 0) 'No selection does not request extension attributes'
+        $selectedRows = @(& $lastPage.Path -DeviceName 'TEST-PC' -ExtensionAttributeNumbers 15,1,5,1 -OutputPath $lastCsv -SkipGraphConnect -PassThru)
+        $selectedColumns = "$baseLastUserColumns,extensionAttribute1,extensionAttribute5,extensionAttribute15"
+        $selectedCsv = @(Import-Csv -LiteralPath $lastCsv)
+        Assert-EntraTest (($selectedRows[0].PSObject.Properties.Name -join ',') -eq $selectedColumns -and $selectedRows[0].extensionAttribute1 -eq 'Primary' -and -not $selectedRows[0].extensionAttribute5 -and $selectedRows[0].extensionAttribute15 -eq 'Fifteen') 'Primary-user fallback appends selected attributes once in numeric order'
+        Assert-EntraTest (($selectedCsv[0].PSObject.Properties.Name -join ',') -eq $selectedColumns -and $selectedCsv[0].extensionAttribute15 -eq 'Fifteen') 'Automatic CSV contains the selected attribute headers and values'
+        $lastPage.Navigation.IsChecked = $true
+        $lastPage.Results.Clear(); $lastPage.Results.Add($selectedRows[0]); Update-EntraResults $lastPage
+        $ui.Window.UpdateLayout()
+        Assert-EntraTest (($lastPage.Table.Columns.Header -join ',') -eq $selectedColumns) 'Output grid generates the selected attribute columns'
+        $attributeExport = Join-Path $tempDirectory 'SelectedAttributes.csv'
+        Export-EntraResults $lastPage $attributeExport
+        $exportedAttributes = @(Import-Csv -LiteralPath $attributeExport)
+        Assert-EntraTest (($exportedAttributes[0].PSObject.Properties.Name -join ',') -eq $selectedColumns -and $exportedAttributes[0].extensionAttribute1 -eq 'Primary') 'Export results retains the selected attribute schema and values'
+        $changedRows = @(& $lastPage.Path -DeviceName 'TEST-PC' -ExtensionAttributeNumbers 5 -OutputPath $lastCsv -SkipGraphConnect -PassThru)
+        $lastPage.Results.Clear(); $lastPage.Results.Add($changedRows[0]); Update-EntraResults $lastPage
+        $ui.Window.UpdateLayout()
+        Assert-EntraTest (($lastPage.Table.Columns.Header -join ',') -eq "$baseLastUserColumns,extensionAttribute5" -and ((Import-Csv -LiteralPath $lastCsv).PSObject.Properties.Name -join ',') -eq "$baseLastUserColumns,extensionAttribute5") 'Rerunning with changed selection removes stale grid and CSV columns'
+        $global:EntraMockState.LastUserDevice = [pscustomobject]@{
+            id='managed-1'; deviceName='TEST-PC'; manufacturer='Test'; model='Model'; azureADDeviceId='aad-device-1'
+            userId='user-1'; userDisplayName='Test User'; userPrincipalName='user@example.test'; emailAddress='user@example.test'
+            usersLoggedOn=@(
+                [pscustomobject]@{ userId='user-2'; lastLogOnDateTime='2026-10-02T10:00:00Z' },
+                [pscustomobject]@{ userId='user-2'; lastLogOnDateTime='2026-10-01T10:00:00Z' },
+                [pscustomobject]@{ userId='user-3'; lastLogOnDateTime='2026-09-01T10:00:00Z' },
+                [pscustomobject]@{ userId='user-4'; lastLogOnDateTime='2026-08-01T10:00:00Z' }
+            )
+        }
+        foreach ($mode in @('Latest','Most','All')) {
+            $modeRows = @(& $lastPage.Path -DeviceName 'TEST-PC' -UserMode $mode -ExtensionAttributeNumbers 1,5,15 -OutputPath $lastCsv -SkipGraphConnect -PassThru)
+            Assert-EntraTest ($modeRows[0].ResolvedUserId -eq 'user-2' -and $modeRows[0].extensionAttribute1 -eq 'Second' -and -not $modeRows[0].extensionAttribute5) "$mode retrieves attributes from the selected logged-on user, not the primary user"
+            if ($mode -eq 'All') {
+                Assert-EntraTest ($modeRows.Count -eq 3 -and -not $modeRows[1].extensionAttribute1 -and -not $modeRows[2].extensionAttribute1 -and @($modeRows | Where-Object { ($_.PSObject.Properties.Name -join ',') -ne $selectedColumns }).Count -eq 0) 'Null and omitted attribute objects retain blank cells and a uniform row schema'
+            }
+        }
+        $global:EntraMockState.RepeatLastUserDevice = $true
+        $global:EntraMockState.LastUserRequests.Clear()
+        $cachedRows = @(& $lastPage.Path -ExtensionAttributeNumbers 1 -OutputPath $lastCsv -SkipGraphConnect -PassThru)
+        Assert-EntraTest ($cachedRows.Count -eq 2 -and ($cachedRows.extensionAttribute1 -join ',') -eq 'Second,Second' -and @($global:EntraMockState.LastUserRequests | Where-Object { $_ -like '*onPremisesExtensionAttributes*' }).Count -eq 1) 'Repeated users reuse a single extended-profile request across devices'
+        $global:EntraMockState.FailedAttributeUserIds = @('user-2')
+        $attributeWarnings = @()
+        $failedAttributeRows = @(& $lastPage.Path -ExtensionAttributeNumbers 1 -OutputPath $lastCsv -SkipGraphConnect -PassThru -WarningVariable attributeWarnings -WarningAction SilentlyContinue)
+        Assert-EntraTest ($failedAttributeRows.Count -eq 2 -and @($failedAttributeRows | Where-Object { $_.LookupPhase -ne 'ExtendedLookupFailed' -or $_.LookupError -notlike '*Attribute lookup denied*' -or $_.extensionAttribute1 -or -not $_.UserPrincipalName }).Count -eq 0 -and $attributeWarnings.Count -eq 2) 'Attribute lookup failures preserve identity, blank cells and explicit diagnostics even for cached users'
+        $global:EntraMockState.FailedAttributeUserIds = @()
+        $global:EntraMockState.FailedUserIds = @('user-2')
+        $failedCoreRows = @(& $lastPage.Path -ExtensionAttributeNumbers 1 -OutputPath $lastCsv -SkipGraphConnect -PassThru -WarningAction SilentlyContinue)
+        Assert-EntraTest ($failedCoreRows.Count -eq 2 -and $failedCoreRows[0].ResolutionStatus -eq 'UsersLoggedOnLookupFailed' -and -not $failedCoreRows[0].extensionAttribute1) 'Core lookup failure retains selected attribute columns without leaking prior values'
+        $global:EntraMockState.LastUserDevice.usersLoggedOn = @()
+        $global:EntraMockState.LastUserDevice.userId = $null
+        $missingRows = @(& $lastPage.Path -ExtensionAttributeNumbers 1 -OutputPath $lastCsv -SkipGraphConnect -PassThru)
+        Assert-EntraTest ($missingRows[0].ResolutionStatus -eq 'PrimaryUserMissing' -and $missingRows[0].PSObject.Properties['extensionAttribute1'] -and -not $missingRows[0].extensionAttribute1) 'Missing user retains the selected blank attribute column'
+        foreach ($invalidNumber in @(0,16)) {
+            $invalidRejected = $false
+            try { & $lastPage.Path -DeviceName 'TEST-PC' -ExtensionAttributeNumbers 1,$invalidNumber -OutputPath $lastCsv -SkipGraphConnect -PassThru }
+            catch { $invalidRejected = $_.FullyQualifiedErrorId -like '*ParameterArgumentValidationError*' }
+            Assert-EntraTest $invalidRejected "Attribute selection rejects out-of-range entry $invalidNumber"
+        }
+    } finally {
+        foreach ($key in @('LastUserRequests','LastUserAttributes','LastUserDevice','RepeatLastUserDevice','FailedAttributeUserIds','FailedUserIds')) { $global:EntraMockState.Remove($key) }
+        $lastPage.Results.Clear(); Update-EntraResults $lastPage
+        $primaryPage.Navigation.IsChecked = $true
+    }
     try {
         $global:EntraMockState.LastUserDevice = [pscustomobject]@{
             id='managed-1'; deviceName='TEST-PC'; manufacturer='Test'; model='Model'; azureADDeviceId='aad-device-1'

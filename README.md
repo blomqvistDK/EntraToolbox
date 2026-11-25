@@ -134,6 +134,7 @@ Both sign-in-only discovery and optional fallback require `Microsoft.Graph.Repor
 .\Features\Get-DevicesLastUser.ps1 -GroupNameOrId 'Pilot Windows Devices' -OutputPath 'C:\Reports\last-users.csv' -PassThru
 .\Features\Get-DevicesLastUser.ps1 -DeviceName 'PC1' -UserMode Most -OutputPath 'C:\Reports\most-users.csv' -PassThru
 .\Features\Get-DevicesLastUser.ps1 -DeviceName 'PC1' -UserMode All -OutputPath 'C:\Reports\all-users.csv' -PassThru
+.\Features\Get-DevicesLastUser.ps1 -DeviceName 'PC1' -ExtensionAttributeNumbers 1,5,15 -OutputPath 'C:\Reports\user-attributes.csv' -PassThru
 ```
 
 The GUI's **User selection** maps to `-UserMode Latest|Most|All`:
@@ -143,6 +144,23 @@ The GUI's **User selection** maps to `-UserMode Latest|Most|All`:
 - **All logged-on users**: each distinct `userId` once per device, ordered by that user's newest logon, newest first. Most-mode ties use the same ordering.
 
 Results and CSV exports retain the existing columns, with one row per selected device/user. `LastLoggedOnUserId` identifies that row's selected logged-on user, not necessarily the device's latest user in Most/All modes. Blank user IDs are ignored; all modes retain the primary-user fallback and missing-user reporting when no usable logged-on ID exists. A device with one usable entry produces the same result in every mode. GUI run-summary counts reflect result rows, which can exceed the number of devices.
+
+Use the **User extension attribute columns (optional)** dropdown to check any combination of
+`extensionAttribute1` through `extensionAttribute15` before running. The dropdown
+stays open while you check several attributes and shows the selection when closed.
+None are selected by default; **Reset** clears all selections. Selections apply to the
+next run, not existing results, and are not saved across launches. The selected
+columns are appended in numeric order to the output grid, report CSV, and
+**Export results** CSV. With none selected, the existing report schema is unchanged.
+
+The standalone equivalent is `-ExtensionAttributeNumbers 1,5,15` (each number must
+be 1-15; duplicates are removed). Values come from the resolved user's Microsoft
+Entra `onPremisesExtensionAttributes`, including when the report falls back to
+the primary user. Unset attributes and missing users produce blank cells.
+Profile/attribute lookup failures retain the row and core identity when available,
+with details in `LookupError`, `LookupPhase` and the activity warnings. The
+existing `User.Read.All` permission covers this read-only retrieval; this does not
+modify user attributes or include other custom/directory extension types.
 
 Use `-CsvPath` instead of device names for CSV input. `-GroupNameOrId` accepts a group object ID or an exact, unique display name. It includes direct device members that also have an Intune managed-device record; it does not expand user members or nested groups. Group input additionally requires the delegated `Device.Read.All`, `Group.Read.All` and `GroupMember.Read.All` permissions. The standalone script's existing no-input behavior scans all managed devices; the GUI continues to require explicit selection of that input mode.
 
