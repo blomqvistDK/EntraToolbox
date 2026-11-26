@@ -77,7 +77,7 @@ The GUI's left menu groups features under section headings in this order, and op
 | Groups | Add Group Members | [Add-MembersToEntraGroup.ps1](Features/Add-MembersToAADGroup/Add-MembersToEntraGroup.ps1) | Adds users, devices, or groups; supports WhatIf |
 | Groups | Create Security Groups | [Create-EntraSecurityGroupsFromCsv.ps1](Features/Create-AADGroups/Create-EntraSecurityGroupsFromCsv.ps1) | Creates/reuses groups and adds optional nested memberships |
 | Users | User Extension Attributes | [Set-ExtensionAttribute.ps1](Features/ExtensionAttributes/Set-ExtensionAttribute.ps1) | Sets/clears extension attributes; supports WhatIf |
-| Devices | Device Cleanup | [Invoke-EntraDeviceCleanup.ps1](Features/Invoke-EntraDeviceCleanup.ps1) | Inspects inventory or explicitly deletes selected cloud-device records |
+| Devices | Device Cleanup | [Invoke-EntraDeviceCleanup.ps1](Features/Invoke-EntraDeviceCleanup.ps1) | Inspects devices from a CSV, an Entra stale-device lookup or typed names, then disables or deletes selected cloud-device records |
 
 `Shared/Invoke-EntraToolboxOperation.ps1` is the GUI's internal background runner for authentication, tenant verification, module loading, and result queuing. Feature scripts do not need to load the GUI or this runner to execute independently.
 
@@ -125,7 +125,7 @@ Sign-in-only discovery resolves device registration IDs from logs against Entra 
 
 The report's `Source` includes each device's event count. In sign-in-only mode, `LastActivity` is that user's newest successful Windows Sign In event on the selected PC, rather than the device-wide approximate activity used by Entra discovery. The result columns and unique device-ID output CSV format are unchanged.
 
-Both sign-in-only discovery and optional fallback require `Microsoft.Graph.Reports`, delegated `AuditLog.Read.All`, appropriate access/consent and applicable Entra ID P1/P2 licensing. Available history is limited by tenant log retention; increasing the lookback does not extend retention. These are observed Entra Windows Sign In events, **not a complete history of local Windows logons**. Sign-in-only discovery cannot be combined with `-SignInFallback` or `-DeviceMode Latest`; Entra discovery supports `Latest|All`, not `Most`.
+Both sign-in-only discovery and optional fallback require `Microsoft.Graph.Reports`, delegated `AuditLog.Read.All`, appropriate access/consent and applicable Entra ID P1/P2 licensing. The signed-in account also needs an active Entra role that can read sign-in logs, such as Reports Reader, Global Reader or Security Reader. Before the first sign-in lookup, the script probes sign-in log access once. If Graph reports a missing role or P1/P2 license, then during the probe or the first lookup, one warning is shown and remaining sign-in lookups are skipped instead of failing for every user. Available history is limited by tenant log retention; increasing the lookback does not extend retention. These are observed Entra Windows Sign In events, **not a complete history of local Windows logons**. Sign-in-only discovery cannot be combined with `-SignInFallback` or `-DeviceMode Latest`; Entra discovery supports `Latest|All`, not `Most`.
 
 ### Device Last User(s)
 
@@ -178,9 +178,22 @@ Use `-CsvPath` instead of device names for CSV input. `-GroupNameOrId` accepts a
 ```powershell
 $devices = .\Features\Invoke-EntraDeviceCleanup.ps1 -CsvPath 'C:\Inputs\devices.csv' -PassThru
 .\Features\Invoke-EntraDeviceCleanup.ps1 -Action Delete -Device $devices[0] -ExpectedTenantId $devices[0].TenantId -AcknowledgeCloudDeletion -WhatIf -PassThru
+
+# Stale Windows devices straight from Entra, or exact device names
+$stale = .\Features\Invoke-EntraDeviceCleanup.ps1 -Source Entra -InactivityDays 90 -PassThru
+$named = .\Features\Invoke-EntraDeviceCleanup.ps1 -Source Names -DeviceName 'PC-001','PC-002' -PassThru
+.\Features\Invoke-EntraDeviceCleanup.ps1 -Action Disable -Device $stale -ExpectedTenantId $stale[0].TenantId -WhatIf -PassThru
 ```
 
 The first command inspects devices. The second previews deletion for one inspected device. Before a real deletion, verify eligibility, tenant, administrator roles and required deletion scopes. `-SkipGraphConnect` can reuse a suitably consented session. Remove `-WhatIf` only for an intentional deletion; normal confirmation remains supported.
+
+Device sources (GUI **Device source** / `-Source`):
+
+- **CSV file** (`Csv`, default): devices listed in a CSV, as before.
+- **Entra lookup** (`Entra`): all Windows devices whose latest activity (Entra approximate sign-in or Intune sync, whichever is newer) is older than `-InactivityDays` (default 90), plus devices that have never reported activity. Autopilot registration is not required; the **Autopilot** column shows it.
+- **Device names** (`Names`): exact, case-insensitive display names, one per line. Every Entra device with a matching name is listed; unknown names are reported as not found.
+
+**Disable selected** (`-Action Disable`) only sets the Entra device `accountEnabled` to false, then re-reads the device to confirm it. Intune and Autopilot records are untouched, already-disabled devices are skipped, and hybrid or unknown join types are blocked. It honours **Preview only**, asks for tenant confirmation, and needs `Directory.AccessAsUser.All` plus Cloud Device Administrator (or higher); the deletion acknowledgement is not required. Deletion does not require the device to be disabled first. A common flow is to load stale devices, disable them, and delete them after a grace period.
 
 Cleanup retains its existing Intune, Autopilot, and remaining Entra deletion sequence, verification rules, hybrid-device restrictions, and cloud-deletion acknowledgement. It does not wipe devices or delete on-premises AD objects. The GUI retains preview-by-default, selection filtering, acknowledgement, tenant checks, and confirmation safeguards.
 

@@ -13,8 +13,8 @@ try {
     if ($context -and $ExpectedTenant -and $context.TenantId -ne $ExpectedTenant) { throw 'Graph tenant changed. Sign out and reconnect before continuing.' }
     if ($context -and $RequestedTenant -and $context.TenantId -ne $RequestedTenant) { throw 'The Graph session belongs to a different tenant. Sign out first.' }
     if (-not $context -or @($Scopes | Where-Object { $_ -notin $context.Scopes }).Count) {
-        if ($Kind -eq 'Run' -and $Parameters['Action'] -eq 'Delete' -and -not $Parameters['WhatIf']) {
-            throw 'Sign in on Device Cleanup with Preview only unchecked to grant deletion permissions before confirming deletion.'
+        if ($Kind -eq 'Run' -and $Parameters['Action'] -in @('Delete','Disable') -and -not $Parameters['WhatIf']) {
+            throw 'Sign in on Device Cleanup with Preview only unchecked to grant write permissions before confirming disable or deletion.'
         }
         $connect = @{ Scopes=$Scopes; NoWelcome=$true; ContextScope='Process'; ErrorAction='Stop' }
         if ($RequestedTenant) { $connect.TenantId = $RequestedTenant }

@@ -134,8 +134,38 @@ if ($UserPrincipalName) {
 $upns = $upns | Where-Object { $_ } | Sort-Object -Unique
 Write-Host "Processing $(@($upns).Count) user(s)..."
 
+$signInAccess = @{ Checked = $false; Blocked = $false }
+
+function Get-SignInAccessBlockMessage {
+    param([string]$Message)
+    if ($Message -match 'Authentication_RequestFromUnsupportedRole') {
+        $account = [string](Get-MgContext).Account
+        $who = if ($account) { "the signed-in account ($account)" } else { 'the signed-in account' }
+        return "Sign-in logs are unavailable: $who has no active Entra role that can read sign-in logs, such as Reports Reader, Global Reader or Security Reader. Activate PIM-eligible roles, then sign in again. Sign-in lookups are skipped."
+    }
+    if ($Message -match 'Authentication_RequestFromNonPremiumTenantOrB2CTenant') {
+        return 'Sign-in logs are unavailable: reading them through Microsoft Graph requires Microsoft Entra ID P1 or P2. Sign-in lookups are skipped.'
+    }
+}
+
+function Test-SignInLogAccess {
+    # One probe turns a missing role or license into a single warning instead of a failure per user.
+    if (-not $signInAccess.Checked) {
+        $signInAccess.Checked = $true
+        $since = (Get-Date).ToUniversalTime().AddDays(-1).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+        try { $null = Get-MgAuditLogSignIn -Filter "createdDateTime ge $since" -Top 1 -ErrorAction Stop }
+        catch {
+            $blockMessage = Get-SignInAccessBlockMessage $_.Exception.Message
+            if ($blockMessage) { $signInAccess.Blocked = $true; Write-Warning $blockMessage }
+            else { Write-Verbose "Sign-in log access precheck was inconclusive: $($_.Exception.Message)" }
+        }
+    }
+    return -not $signInAccess.Blocked
+}
+
 function Get-SignInDevice {
     param($User, [switch]$SignInOnly)
+    if (-not (Test-SignInLogAccess)) { return }
     # Sign-in logs identify devices by deviceId (not object ID) and need Entra ID P1/P2.
     $since = (Get-Date).ToUniversalTime().AddDays(-$SignInDays).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
     $lookupName = if ($SignInOnly) { 'Sign-in discovery' } else { 'Sign-in fallback' }
@@ -145,7 +175,10 @@ function Get-SignInDevice {
     try {
         $signIns = @(Get-MgAuditLogSignIn -Filter "userId eq '$($User.Id)' and appDisplayName eq 'Windows Sign In'$successFilter and createdDateTime ge $since" -All -ErrorAction Stop)
     } catch {
-        Write-Warning "$lookupName query failed for $($User.UserPrincipalName): $($_.Exception.Message)"
+        # The probe can pass when it only sees the operator's own sign-ins, so access may still be denied here.
+        $blockMessage = Get-SignInAccessBlockMessage $_.Exception.Message
+        if ($blockMessage) { $signInAccess.Blocked = $true; Write-Warning $blockMessage }
+        else { Write-Warning "$lookupName query failed for $($User.UserPrincipalName): $($_.Exception.Message)" }
         return
     }
     $deviceSignIns = @($signIns | Where-Object {
@@ -280,6 +313,7 @@ if ($DeviceSource -eq 'Entra' -and $missing.Count -gt 0 -and -not $SignInFallbac
     if ($answer -match '^(y|yes)$') {
         Connect-MgGraph -Scopes ($scopes + 'AuditLog.Read.All') -NoWelcome | Out-Null
         foreach ($user in $missing) {
+            if (-not (Test-SignInLogAccess)) { break }
             $fb = Get-SignInDevice -User $user
             if (-not $fb) { Write-Warning "Sign-in logs gave no Windows device for: $($user.UserPrincipalName)"; continue }
             $results.Add([pscustomobject]@{

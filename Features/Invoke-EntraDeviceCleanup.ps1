@@ -1,18 +1,27 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Inspect CSV-listed Entra devices or delete explicitly selected device records.
+    Inspect Entra devices, then disable or delete explicitly selected device records.
 .DESCRIPTION
+    Inspection sources (-Source):
+      Csv    - devices listed in -CsvPath (default).
+      Entra  - Windows devices in Entra with no activity for at least -InactivityDays,
+               including devices that have never reported activity.
+      Names  - exact (case-insensitive) display names in -DeviceName; all duplicates are listed.
     DeviceId is the Entra registration ID; Id/ObjectId is the directory object ID.
     CSV accepts displayName/DeviceName, id/ObjectId and deviceId, with comma or
     semicolon delimiters. Group exports are restricted to objectType=device rows.
     Activity is the latest Entra approximate sign-in or linked Intune sync (UTC).
+    Disable sets the Entra device accountEnabled to false and touches nothing else.
     Deletion removes Intune, then Autopilot, then any remaining Entra object.
     Hybrid and unknown join types are blocked. No wipe or on-premises AD action.
-    Delegated deletion requires Directory.AccessAsUser.All, Intune write scopes,
-    appropriate administrator roles and an explicit cloud-deletion acknowledgement.
+    Delegated disable/deletion requires Directory.AccessAsUser.All and appropriate
+    administrator roles; deletion also needs Intune write scopes and an explicit
+    cloud-deletion acknowledgement.
     After all Autopilot deletion requests are accepted, waits ten seconds once
     per device before rechecking Entra. Autopilot completion is not verified.
+.PARAMETER InactivityDays
+    Entra source only: minimum days without activity; defaults to 90.
 .PARAMETER RemovalTimeoutSeconds
     Maximum confirmation wait per Intune or Entra record; defaults to 60 seconds.
 .PARAMETER AutopilotRemovalTimeoutSeconds
@@ -23,11 +32,19 @@
 .EXAMPLE
     $devices = .\Invoke-EntraDeviceCleanup.ps1 -CsvPath .\devices.csv -PassThru
     .\Invoke-EntraDeviceCleanup.ps1 -Action Delete -Device $devices[0] -ExpectedTenantId $devices[0].TenantId -AcknowledgeCloudDeletion -WhatIf
+.EXAMPLE
+    $stale = .\Invoke-EntraDeviceCleanup.ps1 -Source Entra -InactivityDays 120 -PassThru
+    .\Invoke-EntraDeviceCleanup.ps1 -Action Disable -Device $stale -ExpectedTenantId $stale[0].TenantId -WhatIf
+.EXAMPLE
+    .\Invoke-EntraDeviceCleanup.ps1 -Source Names -DeviceName 'PC-001','PC-002' -PassThru
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
-    [ValidateSet('Inspect','Delete')][string]$Action = 'Inspect',
+    [ValidateSet('Inspect','Delete','Disable')][string]$Action = 'Inspect',
+    [ValidateSet('Csv','Entra','Names')][string]$Source = 'Csv',
     [string]$CsvPath,
+    [string[]]$DeviceName,
+    [ValidateRange(1,3650)][int]$InactivityDays = 90,
     [object[]]$Device,
     [string]$ExpectedTenantId,
     [switch]$AcknowledgeCloudDeletion,
@@ -56,9 +73,11 @@ function Get-CleanupHttpStatus {
 }
 
 function Invoke-CleanupGraph {
-    param([string]$Uri, [string]$Method = 'GET', [switch]$AllowMissing)
+    param([string]$Uri, [string]$Method = 'GET', [switch]$AllowMissing, [hashtable]$Body)
+    $request = @{ Uri=$Uri; Method=$Method; OutputType='PSObject'; ErrorAction='Stop' }
+    if ($Body) { $request.Body = $Body | ConvertTo-Json -Compress; $request.ContentType = 'application/json' }
     for ($attempt = 0; $attempt -lt 4; $attempt++) {
-        try { return Invoke-MgGraphRequest -Uri $Uri -Method $Method -OutputType PSObject -ErrorAction Stop }
+        try { return Invoke-MgGraphRequest @request }
         catch {
             $status = Get-CleanupHttpStatus $_.Exception
             if ($AllowMissing -and $status -eq 404) { return $null }
@@ -128,7 +147,7 @@ function Get-CleanupCsvTargets {
 
 function Resolve-CleanupTarget {
     param($Target)
-    $properties = 'id,deviceId,displayName,trustType,approximateLastSignInDateTime,physicalIds'
+    $properties = $script:CleanupDeviceProperties
     if ($Target.ObjectId) {
         $found = Invoke-CleanupGraph -Uri "https://graph.microsoft.com/v1.0/devices/$($Target.ObjectId)?`$select=$properties" -AllowMissing
     } elseif ($Target.DeviceId) {
@@ -172,10 +191,13 @@ function New-CleanupDeviceRow {
     $trustType = [string](Get-CleanupProperty $Entra 'trustType')
     $joinType = switch ($trustType) { 'AzureAd' { 'Microsoft Entra joined' } 'Workplace' { 'Microsoft Entra registered' } 'ServerAd' { 'Microsoft Entra hybrid joined' } default { 'Unknown' } }
     $blocked = $trustType -notin @('AzureAd','Workplace') -or [bool]$correlationError
+    $accountEnabled = Get-CleanupProperty $Entra 'accountEnabled'
     [pscustomobject]@{
         'Device Name' = [string](Get-CleanupProperty $Entra 'displayName')
         'Join Type' = $joinType
+        Enabled = if ($accountEnabled -eq $true) { 'Yes' } elseif ($accountEnabled -eq $false) { 'No' } else { '' }
         'Intune managed' = if ($managedMatches.Count) { 'Yes' } else { 'No' }
+        Autopilot = if ($autopilotMatches.Count) { 'Yes' } else { 'No' }
         'Activity date' = if ($dates.Count) { ($dates | Sort-Object -Descending | Select-Object -First 1) } else { $null }
         'Device ID' = $deviceId
         Status = if ($correlationError) { $correlationError } elseif ($blocked) { 'Deletion blocked: hybrid or unknown join type' } else { 'Ready' }
@@ -244,17 +266,37 @@ function Remove-CleanupDeviceRecords {
 if ($PSBoundParameters.ContainsKey('AutopilotRemovalTimeoutSeconds')) {
     Write-Verbose 'AutopilotRemovalTimeoutSeconds is deprecated; the Autopilot-to-Entra delay is fixed at ten seconds.'
 }
-if ($Action -eq 'Inspect' -and (-not $CsvPath -or $Device)) { throw 'Inspection requires CsvPath, not deletion targets.' }
-if ($Action -eq 'Delete' -and (-not @($Device).Count -or $CsvPath -or -not $ExpectedTenantId -or -not $AcknowledgeCloudDeletion)) {
+$script:CleanupDeviceProperties = 'id,deviceId,displayName,trustType,approximateLastSignInDateTime,physicalIds,accountEnabled'
+$names = @($DeviceName | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+if ($Action -eq 'Inspect') {
+    if ($Device) { throw 'Inspection requires a source (CsvPath, DeviceName or Entra lookup), not deletion targets.' }
+    if ($Source -eq 'Csv' -and (-not $CsvPath -or $DeviceName)) { throw 'Inspection requires CsvPath, not deletion targets.' }
+    if ($Source -eq 'Names' -and (-not $names.Count -or $CsvPath)) { throw 'Device name inspection requires at least one DeviceName, not CsvPath.' }
+    if ($Source -eq 'Entra' -and ($CsvPath -or $DeviceName)) { throw 'Entra lookup does not use CsvPath or DeviceName.' }
+}
+if ($Action -eq 'Delete' -and (-not @($Device).Count -or $CsvPath -or $DeviceName -or -not $ExpectedTenantId -or -not $AcknowledgeCloudDeletion)) {
     throw 'Deletion requires selected Device records, ExpectedTenantId and AcknowledgeCloudDeletion, not CsvPath.'
 }
-$targets = if ($Action -eq 'Inspect') { @(Get-CleanupCsvTargets -Path $CsvPath) } else { @($Device) }
-if (-not @($targets).Count) { throw 'No device rows were supplied.' }
+if ($Action -eq 'Disable' -and (-not @($Device).Count -or $CsvPath -or $DeviceName -or -not $ExpectedTenantId)) {
+    throw 'Disable requires selected Device records and ExpectedTenantId, not CsvPath or DeviceName.'
+}
+$targets = switch ($Action) {
+    'Inspect' {
+        switch ($Source) {
+            'Csv' { @(Get-CleanupCsvTargets -Path $CsvPath) }
+            'Names' { @($names | ForEach-Object { [pscustomobject]@{ Name=$_; ObjectId=''; DeviceId='' } }) }
+            'Entra' { @() }
+        }
+    }
+    default { @($Device) }
+}
+if (-not @($targets).Count -and -not ($Action -eq 'Inspect' -and $Source -eq 'Entra')) { throw 'No device rows were supplied.' }
 if (-not $SkipGraphConnect) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
 $scopes = @('Device.Read.All','DeviceManagementManagedDevices.Read.All','DeviceManagementServiceConfig.Read.All')
 if ($Action -eq 'Delete' -and -not $WhatIfPreference) {
     $scopes += @('Directory.AccessAsUser.All','DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementServiceConfig.ReadWrite.All')
 }
+if ($Action -eq 'Disable' -and -not $WhatIfPreference) { $scopes += 'Directory.AccessAsUser.All' }
 $context = Get-MgContext
 if ($context -and $ExpectedTenantId -and $context.TenantId -ne $ExpectedTenantId) { throw 'Graph session belongs to a different tenant.' }
 if (-not $context -or @($scopes | Where-Object { $_ -notin $context.Scopes }).Count) {
@@ -268,21 +310,32 @@ if (-not $context -or ($ExpectedTenantId -and $context.TenantId -ne $ExpectedTen
 $tenant = [string]$context.TenantId
 $managed = @(Get-CleanupCollection -Uri 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=id,azureADDeviceId,lastSyncDateTime')
 $autopilot = @(Get-CleanupCollection -Uri 'https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities')
+$staleCutoff = $null
+if ($Action -eq 'Inspect' -and $Source -eq 'Entra') {
+    $staleCutoff = [DateTime]::UtcNow.AddDays(-$InactivityDays)
+    $windowsDevices = @(Get-CleanupCollection -Uri "https://graph.microsoft.com/v1.0/devices?`$filter=operatingSystem eq 'Windows'&`$select=$($script:CleanupDeviceProperties)&`$top=999")
+    Write-Information "Entra lookup: $($windowsDevices.Count) Windows device(s); listing those without activity since $($staleCutoff.ToString('yyyy-MM-dd')) UTC."
+    $targets = @($windowsDevices | ForEach-Object {
+        [pscustomobject]@{ Name=[string](Get-CleanupProperty $_ 'displayName'); ObjectId=[string](Get-CleanupProperty $_ 'id'); DeviceId=[string](Get-CleanupProperty $_ 'deviceId'); Entry=$_ }
+    })
+}
 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($target in $targets) {
     $row = $null
     try {
         if ((Get-MgContext).TenantId -ne $tenant) { throw 'Graph tenant changed.' }
-        if ($Action -eq 'Delete') {
+        if ($Action -ne 'Inspect') {
             if ($target.TenantId -ne $tenant -or -not $target.CanDelete) { throw 'Selected device is blocked or belongs to a different tenant.' }
             $objectId = [guid]::Parse([string]$target.ObjectId).ToString()
             $lookupTarget = [pscustomobject]@{ ObjectId=$objectId; DeviceId=[string]$target.'Device ID'; Name='' }
         } else { $lookupTarget = $target }
-        $entries = @(Resolve-CleanupTarget -Target $lookupTarget)
-        if (-not $entries.Count) { throw 'Device not found in Entra. No records were deleted.' }
+        $entra = Get-CleanupProperty $target 'Entry'
+        $entries = @(if ($Action -eq 'Inspect' -and $null -ne $entra) { $entra } else { Resolve-CleanupTarget -Target $lookupTarget })
+        if (-not $entries.Count) { throw 'Device not found in Entra. No records were changed.' }
         foreach ($entry in $entries) {
             if (-not $seen.Add([string](Get-CleanupProperty $entry 'id'))) { continue }
             $row = New-CleanupDeviceRow -Entra $entry -Managed $managed -Autopilot $autopilot -Tenant $tenant
+            if ($staleCutoff -and $null -ne $row.'Activity date' -and $row.'Activity date' -ge $staleCutoff) { $row = $null; continue }
             if ($Action -eq 'Delete') {
                 if (-not $row.CanDelete) { throw $row.Status }
                 if ($PSCmdlet.ShouldProcess("$tenant / $($row.'Device Name') / $($row.ObjectId)", 'Delete Intune records, deregister Autopilot and delete remaining cloud Entra device')) {
@@ -291,17 +344,28 @@ foreach ($target in $targets) {
                     $row.Status = if ($row.AutopilotRemovalRequested) { 'Entra removed; Autopilot removal requested' } else { 'Deleted' }
                     $row.CanDelete = $false; $row.'Intune managed' = 'No'
                 } else { $row.Status = 'Preview; no changes' }
+            } elseif ($Action -eq 'Disable') {
+                if (-not $row.CanDelete) { throw $row.Status }
+                if ($row.Enabled -eq 'No') { $row.Status = 'Already disabled' }
+                elseif ($PSCmdlet.ShouldProcess("$tenant / $($row.'Device Name') / $($row.ObjectId)", 'Disable Entra device (accountEnabled = false)')) {
+                    if ((Get-MgContext).TenantId -ne $tenant) { throw 'Graph tenant changed; disable stopped.' }
+                    $uri = "https://graph.microsoft.com/v1.0/devices/$($row.ObjectId)"
+                    Invoke-CleanupGraph -Uri $uri -Method PATCH -Body @{ accountEnabled = $false } | Out-Null
+                    $refreshed = Invoke-CleanupGraph -Uri "$uri`?`$select=id,accountEnabled"
+                    if ((Get-CleanupProperty $refreshed 'accountEnabled') -ne $false) { throw 'Disable was requested, but Entra still reports the device as enabled.' }
+                    $row.Enabled = 'No'; $row.Status = 'Disabled'
+                } else { $row.Status = 'Preview; no changes' }
             }
-            if ($PassThru) { $row } else { $row | Select-Object 'Device Name','Join Type','Intune managed','Activity date','Device ID',Status }
+            if ($PassThru) { $row } else { $row | Select-Object 'Device Name','Join Type',Enabled,'Intune managed',Autopilot,'Activity date','Device ID',Status }
         }
     } catch [System.Management.Automation.PipelineStoppedException] {
         throw
     } catch {
         if (-not $row) {
             $row = [pscustomobject]@{
-                'Device Name'=[string](Get-CleanupProperty $target 'Name'); 'Join Type'='Unknown'; 'Intune managed'=''; 'Activity date'=$null
+                'Device Name'=[string](Get-CleanupProperty $target 'Name'); 'Join Type'='Unknown'; Enabled=''; 'Intune managed'=''; Autopilot=''; 'Activity date'=$null
                 'Device ID'=[string](Get-CleanupProperty $target 'DeviceId'); Status=''; ObjectId=[string](Get-CleanupProperty $target 'ObjectId')
-                TenantId=$tenant; ManagedDeviceIds=@(); AutopilotIds=@(); CanDelete=$false
+                TenantId=$tenant; ManagedDeviceIds=@(); AutopilotIds=@(); AutopilotRemovalRequested=$false; CanDelete=$false
             }
         }
         if ($_.Exception -is [TimeoutException] -and $_.Exception.Data['CleanupConfirmationTimeout']) {

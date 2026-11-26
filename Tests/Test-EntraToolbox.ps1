@@ -166,7 +166,22 @@ $primaryPage = $ui.Pages | Where-Object { $_.Id -eq 'PrimaryPC' }
 $lastPage = $ui.Pages | Where-Object { $_.Id -eq 'LastUser' }
 $attributePage = $ui.Pages | Where-Object { $_.Id -eq 'Attributes' }
 $cleanupPage = $ui.Pages | Where-Object { $_.Id -eq 'DeviceCleanup' }
-Assert-EntraTest ($cleanupPage.Table.Columns.Count -eq 6 -and $cleanupPage.Controls.Preview.IsChecked -and -not $cleanupPage.DeleteSelected.IsEnabled) 'Cleanup columns, preview default and disabled deletion'
+Assert-EntraTest ($cleanupPage.Table.Columns.Count -eq 8 -and $cleanupPage.Controls.Preview.IsChecked -and -not $cleanupPage.DeleteSelected.IsEnabled -and -not $cleanupPage.DisableSelected.IsEnabled) 'Cleanup columns, preview default and disabled deletion'
+Assert-EntraTest ($cleanupPage.Controls.Source.SelectedItem -eq 'CSV file' -and $cleanupPage.Fields.CsvPath.Visibility -eq 'Visible' -and $cleanupPage.Fields.InactivityDays.Visibility -eq 'Collapsed' -and $cleanupPage.Fields.DeviceNames.Visibility -eq 'Collapsed') 'Cleanup defaults to the CSV source'
+$cleanupPage.Controls.Source.SelectedItem = 'Entra lookup'
+Assert-EntraTest ($cleanupPage.Fields.CsvPath.Visibility -eq 'Collapsed' -and $cleanupPage.Fields.InactivityDays.Visibility -eq 'Visible' -and $cleanupPage.Controls.InactivityDays.Text -eq '90') 'Entra lookup shows inactivity days defaulting to 90'
+$entraInvocation = Get-EntraInvocation $cleanupPage
+Assert-EntraTest ($entraInvocation.Parameters.Source -eq 'Entra' -and $entraInvocation.Parameters.InactivityDays -eq 90 -and -not $entraInvocation.Parameters.ContainsKey('CsvPath')) 'Entra lookup builds Source Entra with inactivity days'
+$cleanupPage.Controls.InactivityDays.Text = '0'
+$daysRejected = $false
+try { Get-EntraInvocation $cleanupPage | Out-Null } catch { $daysRejected = $true }
+Assert-EntraTest $daysRejected 'Entra lookup rejects invalid inactivity days'
+$cleanupPage.Controls.InactivityDays.Text = '90'
+$cleanupPage.Controls.Source.SelectedItem = 'Device names'
+$cleanupPage.Controls.DeviceNames.Text = " PC-1 `r`n`r`nPC-2"
+$namesInvocation = Get-EntraInvocation $cleanupPage
+Assert-EntraTest ($cleanupPage.Fields.DeviceNames.Visibility -eq 'Visible' -and $namesInvocation.Parameters.Source -eq 'Names' -and ($namesInvocation.Parameters.DeviceName -join ',') -eq 'PC-1,PC-2') 'Device names source passes trimmed names'
+$cleanupPage.Controls.DeviceNames.Text = ''; $cleanupPage.Controls.Source.SelectedItem = 'CSV file'
 Assert-EntraTest (-not $primaryPage.Run.IsEnabled) 'Primary-PC Run initially disabled despite output and lookback defaults'
 $primarySources = @{ 'Group name'='GroupName'; 'Group ID'='GroupId'; 'User CSV'='CsvPath'; 'User UPNs'='UserPrincipalName' }
 foreach ($source in $primarySources.Keys) {
@@ -488,8 +503,16 @@ try {
         function Get-MgUserOwnedDevice { throw 'Sign-in-only mode queried owned devices' }
         function Get-MgUserRegisteredDevice { throw 'Sign-in-only mode queried registered devices' }
         function Get-MgAuditLogSignIn {
-            [CmdletBinding()]param($Filter,[switch]$All)
+            [CmdletBinding()]param($Filter,[switch]$All,[int]$Top)
+            $roleError = '[Authentication_RequestFromUnsupportedRole] : User is not in the allowed roles'
+            if ($Top) {
+                $signInState.Probes++
+                if ($signInState.Mode -eq 'NoRole') { throw $roleError }
+                return
+            }
+            $signInState.Queries++
             $signInState.Filter = $Filter; $signInState.All = [bool]$All
+            if ($signInState.Mode -in @('NoRole','NoRoleAfterProbe')) { throw $roleError }
             if ($signInState.Mode -eq 'QueryError') { throw 'Audit access denied' }
             if ($signInState.Mode -eq 'Empty') { return }
             return $signInEvents.ToArray()
@@ -550,6 +573,13 @@ try {
             $expectedWarning = if ($mode -eq 'QueryError') { '*query failed*Audit access denied*' } else { '*no successful Windows Sign In events with a device ID*' }
             Assert-EntraTest ($emptyLogRows.Count -eq 0 -and ($logWarnings -join ' ') -like $expectedWarning) "Sign-in-only $mode warns without prompting or querying owned/registered devices"
         }
+        foreach ($mode in @('NoRole','NoRoleAfterProbe')) {
+            $signInState.Mode = $mode; $signInState.Probes = 0; $signInState.Queries = 0; $logWarnings = @()
+            $deniedRows = @(& $primaryPage.Path @csvParameters -WarningVariable logWarnings)
+            $expectedQueries = if ($mode -eq 'NoRole') { 0 } else { 1 }
+            Assert-EntraTest ($deniedRows.Count -eq 0 -and @($logWarnings).Count -eq 1 -and "$($logWarnings[0])" -like '*no active Entra role*Reports Reader*' -and $signInState.Probes -eq 1 -and $signInState.Queries -eq $expectedQueries) "Missing sign-in role ($mode) warns once and skips remaining users' lookups"
+        }
+        $signInState.Mode = 'Events'
         foreach ($invalidOptions in @(@{ DeviceMode='Latest' },@{ SignInFallback=$true })) {
             $invalidRejected = $false
             try { & $primaryPage.Path @logParameters @invalidOptions | Out-Null } catch { $invalidRejected = $_.Exception.Message -match 'not supported|only supported' }
@@ -856,7 +886,8 @@ try {
 
     Add-Type -TypeDefinition 'public class EntraCleanupTestException : System.Exception { public int ResponseStatusCode { get; set; } public EntraCleanupTestException(int status) : base("Mock Graph failure") { ResponseStatusCode = status; } }'
     $cleanupState = @{
-        Entra=[pscustomobject]@{ id='cccccccc-1111-1111-1111-111111111111'; deviceId='dddddddd-1111-1111-1111-111111111111'; displayName='TEST-CLEANUP'; trustType='AzureAd'; physicalIds=@('[ZTDId]:autopilot-1'); approximateLastSignInDateTime='2026-10-20T08:00:00Z' }
+        Entra=[pscustomobject]@{ id='cccccccc-1111-1111-1111-111111111111'; deviceId='dddddddd-1111-1111-1111-111111111111'; displayName='TEST-CLEANUP'; trustType='AzureAd'; physicalIds=@('[ZTDId]:autopilot-1'); approximateLastSignInDateTime='2026-10-20T08:00:00Z'; accountEnabled=$true }
+        ExtraDevices=@()
         Managed=@([pscustomobject]@{ id='managed-cleanup'; azureADDeviceId='dddddddd-1111-1111-1111-111111111111'; lastSyncDateTime='2026-10-21T10:00:00+02:00' })
         Autopilot=@([pscustomobject]@{ id='autopilot-1'; azureActiveDirectoryDeviceId='dddddddd-1111-1111-1111-111111111111'; managedDeviceId='managed-cleanup' })
         Removed=@{}; Writes=[Collections.Generic.List[string]]::new(); FailStage=''; InventoryFailure=$false; Sticky=$false; DuplicateName=$false; AutoRemoveEntra=$false
@@ -881,8 +912,13 @@ try {
         }
     }
     function Invoke-MgGraphRequest {
-        [CmdletBinding()]param($Method,$Uri,$OutputType)
+        [CmdletBinding()]param($Method,$Uri,$OutputType,$Body,$ContentType)
         [void]$cleanupState.Events.Add("${Method}:$($Uri.Split('/')[-1])")
+        if ($Method -eq 'PATCH') {
+            [void]$cleanupState.Writes.Add("PATCH $Uri $Body")
+            if ($Uri -like "*/$($cleanupState.Entra.id)") { $cleanupState.Entra.accountEnabled = $false }
+            return
+        }
         if ($Method -eq 'DELETE') {
             if ($cleanupState.FailStage -and $Uri -like "*$($cleanupState.FailStage)*") { throw [EntraCleanupTestException]::new(403) }
             [void]$cleanupState.Writes.Add($Uri)
@@ -955,7 +991,12 @@ try {
         }
         if ($Uri -like '*devices?*') {
             $values = @($cleanupState.Entra)
-            if ($cleanupState.DuplicateName) { $values += [pscustomobject]@{ id='cccccccc-2222-2222-2222-222222222222'; deviceId='dddddddd-2222-2222-2222-222222222222'; displayName='TEST-CLEANUP'; trustType='Workplace'; physicalIds=@(); approximateLastSignInDateTime=$null } }
+            if ($cleanupState.DuplicateName) { $values += [pscustomobject]@{ id='cccccccc-2222-2222-2222-222222222222'; deviceId='dddddddd-2222-2222-2222-222222222222'; displayName='TEST-CLEANUP'; trustType='Workplace'; physicalIds=@(); approximateLastSignInDateTime=$null; accountEnabled=$true } }
+            if ($Uri -match "operatingSystem eq 'Windows'") { $values += @($cleanupState.ExtraDevices) }
+            if ($Uri -match "displayName eq '([^']*)'") {
+                $requestedName = [Uri]::UnescapeDataString($Matches[1])
+                $values = @($values | Where-Object { $_.displayName -eq $requestedName })
+            }
             return [pscustomobject]@{ value=$values; '@odata.nextLink'=$null }
         }
         throw "Unexpected cleanup mock URI: $Uri"
@@ -978,11 +1019,70 @@ try {
     Assert-EntraTest ('Directory.AccessAsUser.All' -notin $requirements.Scopes) 'Inspection requests read permissions only'
     $requirements = Get-EntraRequirements $cleanupPage @{ Action='Delete'; WhatIf=$false }
     Assert-EntraTest ('Directory.AccessAsUser.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -in $requirements.Scopes) 'Deletion requests delegated directory and Intune write permissions'
+    $requirements = Get-EntraRequirements $cleanupPage @{ Action='Disable'; WhatIf=$false }
+    Assert-EntraTest ('Directory.AccessAsUser.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -notin $requirements.Scopes) 'Disable requests only the directory write permission'
+    $requirements = Get-EntraRequirements $cleanupPage @{ Action='Disable'; WhatIf=$true }
+    Assert-EntraTest ('Directory.AccessAsUser.All' -notin $requirements.Scopes) 'Disable preview requests read permissions only'
+
+    $recentSync = [DateTime]::UtcNow.AddDays(-2).ToString('o')
+    $cleanupState.ExtraDevices = @(
+        [pscustomobject]@{ id='cccccccc-3333-3333-3333-333333333333'; deviceId='dddddddd-3333-3333-3333-333333333333'; displayName='STALE-PC'; trustType='AzureAd'; physicalIds=@(); approximateLastSignInDateTime='2020-01-01T00:00:00Z'; accountEnabled=$true },
+        [pscustomobject]@{ id='cccccccc-4444-4444-4444-444444444444'; deviceId='dddddddd-4444-4444-4444-444444444444'; displayName='NEVER-PC'; trustType='AzureAd'; physicalIds=@(); approximateLastSignInDateTime=$null; accountEnabled=$false },
+        [pscustomobject]@{ id='cccccccc-5555-5555-5555-555555555555'; deviceId='dddddddd-5555-5555-5555-555555555555'; displayName='RECENT-PC'; trustType='AzureAd'; physicalIds=@(); approximateLastSignInDateTime=$recentSync; accountEnabled=$true },
+        [pscustomobject]@{ id='cccccccc-6666-6666-6666-666666666666'; deviceId='dddddddd-6666-6666-6666-666666666666'; displayName='SYNCED-PC'; trustType='AzureAd'; physicalIds=@(); approximateLastSignInDateTime='2020-01-01T00:00:00Z'; accountEnabled=$true })
+    $savedManaged = $cleanupState.Managed
+    $cleanupState.Managed = @($savedManaged) + [pscustomobject]@{ id='managed-synced'; azureADDeviceId='dddddddd-6666-6666-6666-666666666666'; lastSyncDateTime=$recentSync }
+    $staleRows = @(& $cleanupPage.Path -Source Entra -InactivityDays 30 -SkipGraphConnect -PassThru)
+    $staleNames = @($staleRows | Where-Object { $_.'Device Name' -ne 'TEST-CLEANUP' } | ForEach-Object { $_.'Device Name' } | Sort-Object)
+    Assert-EntraTest (($staleNames -join ',') -eq 'NEVER-PC,STALE-PC' -and $cleanupState.Writes.Count -eq 0) 'Entra lookup lists stale and never-active Windows devices but not recent Entra or Intune activity'
+    $neverRow = @($staleRows | Where-Object { $_.'Device Name' -eq 'NEVER-PC' })[0]
+    Assert-EntraTest ($neverRow.Enabled -eq 'No' -and $neverRow.Autopilot -eq 'No' -and $null -eq $neverRow.'Activity date' -and @($staleRows | Where-Object { $_.'Device Name' -eq 'STALE-PC' })[0].Enabled -eq 'Yes') 'Entra lookup rows show enabled state and Autopilot registration'
+    Assert-EntraTest (@($cleanupState.Events | Where-Object { $_ -like "GET:devices?*operatingSystem eq 'Windows'*" }).Count -eq 1) 'Entra lookup queries Windows devices once'
+    $cleanupState.Managed = $savedManaged; $cleanupState.ExtraDevices = @()
+    $cleanupState.DuplicateName = $true
+    $nameRows = @(& $cleanupPage.Path -Source Names -DeviceName ' test-cleanup ','TEST-CLEANUP','MISSING-PC' -SkipGraphConnect -PassThru 3>$null)
+    $cleanupState.DuplicateName = $false
+    Assert-EntraTest ($nameRows.Count -eq 3 -and @($nameRows | Where-Object { $_.'Device Name' -eq 'TEST-CLEANUP' }).Count -eq 2) 'Device names match exactly once per name and list every duplicate'
+    Assert-EntraTest (@($nameRows | Where-Object { $_.'Device Name' -eq 'MISSING-PC' -and $_.Status -like 'Failed:*not found*' -and -not $_.CanDelete }).Count -eq 1) 'Unknown device names are reported as not found'
+    $namesRejected = $false
+    try { & $cleanupPage.Path -Source Names -DeviceName ' ' -SkipGraphConnect -PassThru | Out-Null } catch { $namesRejected = $true }
+    Assert-EntraTest $namesRejected 'Device names source requires at least one name'
+
+    $disableArguments = @{ Action='Disable'; Device=@($cleanupRows[0]); ExpectedTenantId=$cleanupRows[0].TenantId; SkipGraphConnect=$true; PassThru=$true; Confirm=$false }
+    $cleanupState.Writes.Clear()
+    $disablePreview = @(& $cleanupPage.Path @disableArguments -WhatIf)
+    Assert-EntraTest ($disablePreview[0].Status -eq 'Preview; no changes' -and $cleanupState.Writes.Count -eq 0 -and $cleanupState.Entra.accountEnabled) 'Disable WhatIf does not write'
+    $disabledRows = @(& $cleanupPage.Path @disableArguments)
+    Assert-EntraTest ($disabledRows[0].Status -eq 'Disabled' -and $disabledRows[0].Enabled -eq 'No' -and $disabledRows[0].CanDelete -and $cleanupState.Writes.Count -eq 1 -and $cleanupState.Writes[0] -like "PATCH */devices/$($cleanupState.Entra.id) *accountEnabled*false*") 'Disable patches only accountEnabled and confirms the result'
+    Assert-EntraTest (@($cleanupState.Writes | Where-Object { $_ -notlike 'PATCH*' }).Count -eq 0) 'Disable never deletes Intune, Autopilot or Entra records'
+    $alreadyRows = @(& $cleanupPage.Path @disableArguments)
+    Assert-EntraTest ($alreadyRows[0].Status -eq 'Already disabled' -and $cleanupState.Writes.Count -eq 1) 'Already disabled device is skipped without another write'
+    Assert-EntraTest ((Get-EntraOutcomeCategory $disabledRows[0]) -eq 'Success' -and (Get-EntraOutcomeCategory $alreadyRows[0]) -eq 'Skipped') 'Disable outcomes count as success or skipped'
+    $cleanupState.Entra.accountEnabled = $true; $cleanupState.Entra.trustType = 'ServerAd'
+    $hybridDisable = @(& $cleanupPage.Path @disableArguments 3>$null)
+    Assert-EntraTest ($hybridDisable[0].Status -like 'Failed:*blocked*' -and $cleanupState.Writes.Count -eq 1) 'Refreshed hybrid identity blocks disable'
+    $cleanupState.Entra.trustType = 'AzureAd'
+    $disableRejected = $false
+    try { & $cleanupPage.Path -Action Disable -Device $cleanupRows[0] -SkipGraphConnect -PassThru -Confirm:$false | Out-Null } catch { $disableRejected = $true }
+    Assert-EntraTest ($disableRejected -and $cleanupState.Writes.Count -eq 1) 'Disable requires the expected tenant'
+    $cleanupState.Writes.Clear(); $cleanupState.Events.Clear()
     $script:ConnectedTenant = $cleanupRows[0].TenantId
     $cleanupPage.Results.Clear(); [void]$cleanupPage.Results.Add($cleanupRows[0]); Update-EntraResults $cleanupPage
     $cleanupPage.Table.SelectedItem = $cleanupRows[0]
     $deletion = Get-EntraCleanupDeletionInvocation $cleanupPage
     Assert-EntraTest ($deletion.Preview -and $deletion.Parameters.Device.Count -eq 1 -and $cleanupPage.DeleteSelected.IsEnabled) 'Cleanup selected preview captures only eligible same-tenant IDs'
+    $disableInvocation = Get-EntraCleanupDisableInvocation $cleanupPage
+    Assert-EntraTest ($cleanupPage.DisableSelected.IsEnabled -and $disableInvocation.Preview -and $disableInvocation.Parameters.Action -eq 'Disable' -and $disableInvocation.Parameters.Device.Count -eq 1 -and -not $disableInvocation.Parameters.ContainsKey('AcknowledgeCloudDeletion')) 'Disable selected previews enabled eligible devices without the deletion acknowledgement'
+    $cleanupPage.Controls.Preview.IsChecked = $false
+    $disableInvocation = Get-EntraCleanupDisableInvocation $cleanupPage
+    Assert-EntraTest (-not $disableInvocation.Preview -and $disableInvocation.Summary -like 'Disable 1 selected device*' -and (Get-EntraConfirmationMessage $cleanupPage $disableInvocation) -like "*Tenant: $script:ConnectedTenant*") 'Live disable requires a tenant confirmation but no acknowledgement'
+    $cleanupPage.Controls.Preview.IsChecked = $true
+    $disabledCopy = $cleanupRows[0].PSObject.Copy(); $disabledCopy.Enabled = 'No'
+    $cleanupPage.Results.Clear(); [void]$cleanupPage.Results.Add($disabledCopy); Update-EntraResults $cleanupPage
+    $cleanupPage.Table.SelectedItem = $disabledCopy; Update-EntraCleanupSelection $cleanupPage
+    Assert-EntraTest (-not $cleanupPage.DisableSelected.IsEnabled -and $cleanupPage.DeleteSelected.IsEnabled) 'Disable selected ignores devices that are already disabled'
+    $cleanupPage.Results.Clear(); [void]$cleanupPage.Results.Add($cleanupRows[0]); Update-EntraResults $cleanupPage
+    $cleanupPage.Table.SelectedItem = $cleanupRows[0]
     Assert-EntraTest ((Get-EntraConfirmationMessage -Page $cleanupPage -Invocation $deletion) -eq 'Delete 1 selected device?') 'Cleanup confirmation shows only the selected-device count'
     $cleanupPage.Results.Clear()
     foreach ($number in 1..200) {

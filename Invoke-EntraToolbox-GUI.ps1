@@ -369,8 +369,8 @@ function Get-EntraOutcomeCategory {
     $outcome = $values -join ' '
     if ($outcome -match '(?i)\bwhatif\b|\bpreview\b') { return 'Preview' }
     if ($outcome -match '(?i)fail|error|not found|missing|blocked') { return 'Failed' }
-    if ($outcome -match '(?i)skip|already\s+(?:a\s+)?member|already\s+exists|same as target') { return 'Skipped' }
-    if ($outcome -match '(?i)\b(?:added|created|reused|ok|deleted|removed|usersloggedonresolved|primaryuserresolved)\b') { return 'Success' }
+    if ($outcome -match '(?i)skip|already\s+(?:a\s+)?member|already\s+exists|already\s+disabled|same as target') { return 'Skipped' }
+    if ($outcome -match '(?i)\b(?:added|created|reused|ok|deleted|removed|disabled|usersloggedonresolved|primaryuserresolved)\b') { return 'Success' }
     return 'Other'
 }
 
@@ -469,6 +469,12 @@ function Update-EntraForm {
             $Page.Fields.CsvPath.Visibility = if ($controls.Source.SelectedItem -eq 'CSV file') { 'Visible' } else { 'Collapsed' }
             $Page.Fields.GroupNameOrId.Visibility = if ($controls.Source.SelectedItem -eq 'Entra group') { 'Visible' } else { 'Collapsed' }
         }
+        'DeviceCleanup' {
+            $sourceFields = @{ 'CSV file'='CsvPath'; 'Entra lookup'='InactivityDays'; 'Device names'='DeviceNames' }
+            foreach ($source in $sourceFields.Keys) {
+                $Page.Fields[$sourceFields[$source]].Visibility = if ($controls.Source.SelectedItem -eq $source) { 'Visible' } else { 'Collapsed' }
+            }
+        }
         'Attributes' {
             $fromFile = $controls.Source.SelectedItem -eq 'CSV file'
             $Page.Fields.UserPrincipalName.Visibility = if ($fromFile) { 'Collapsed' } else { 'Visible' }
@@ -502,10 +508,26 @@ function Get-EntraInvocation {
     $preview = $false
     switch ($Page.Id) {
         'DeviceCleanup' {
-            $path = $controls.CsvPath.Text.Trim()
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Select an existing device CSV.' }
-            $parameters.CsvPath = $path
             $parameters.Action = 'Inspect'
+            switch ([string]$controls.Source.SelectedItem) {
+                'Entra lookup' {
+                    $days = 0
+                    if (-not [int]::TryParse($controls.InactivityDays.Text.Trim(), [ref]$days) -or $days -lt 1 -or $days -gt 3650) { throw 'Inactive days must be a whole number from 1 to 3650.' }
+                    $parameters.Source = 'Entra'
+                    $parameters.InactivityDays = $days
+                }
+                'Device names' {
+                    $names = @(Get-EntraLines $controls.DeviceNames.Text)
+                    if (-not $names.Count) { throw 'Enter at least one device name.' }
+                    $parameters.Source = 'Names'
+                    $parameters.DeviceName = [string[]]$names
+                }
+                default {
+                    $path = $controls.CsvPath.Text.Trim()
+                    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Select an existing device CSV.' }
+                    $parameters.CsvPath = $path
+                }
+            }
         }
         'Members' {
             $target = $controls.TargetGroupName.Text.Trim()
@@ -628,6 +650,7 @@ function Get-EntraRequirements {
         ($Parameters.Count -eq 0 -and -not $Page.Controls.Preview.IsChecked))) {
         $scopes += @('Directory.AccessAsUser.All','DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementServiceConfig.ReadWrite.All')
     }
+    if ($Page.Id -eq 'DeviceCleanup' -and $Parameters['Action'] -eq 'Disable' -and -not $Parameters['WhatIf']) { $scopes += 'Directory.AccessAsUser.All' }
     if ($Page.Id -eq 'Members') {
         if ($Parameters.MemberType -eq 'Users') { $modules += 'Microsoft.Graph.Users' }
         if ($Parameters.MemberType -eq 'Devices') { $modules += 'Microsoft.Graph.Identity.DirectoryManagement' }
@@ -682,7 +705,7 @@ function Select-EntraCleanupRows {
         if ($DateMode -eq 'Unknown dates' -and $null -ne $date) { continue }
         if ($DateMode -eq 'Known dates' -and $null -eq $date) { continue }
         if (($startDate -or $endDate) -and ($null -eq $date -or ($startDate -and $date -lt $startDate) -or ($endDate -and $date -ge $endDate))) { continue }
-        if ($Search -and ($row.'Device Name',$row.'Join Type',$row.'Intune managed',$row.'Device ID',$row.Status -join ' ').IndexOf($Search,[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        if ($Search -and ($row.'Device Name',$row.'Join Type',$row.Enabled,$row.'Intune managed',$row.'Device ID',$row.Status -join ' ').IndexOf($Search,[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         $row
     }
 }
@@ -701,12 +724,22 @@ function Get-EntraCleanupSelection {
     @($Page.Table.SelectedItems | Where-Object { $_ -in $eligible })
 }
 
+function Get-EntraCleanupDisableSelection {
+    param($Page)
+    @(Get-EntraCleanupSelection $Page | Where-Object { $_.Enabled -ne 'No' })
+}
+
 function Update-EntraCleanupSelection {
     param($Page)
     if (-not $Page.ContainsKey('DeleteSelected')) { return }
     $selected = @(Get-EntraCleanupSelection $Page)
     $Page.DeleteSelected.IsEnabled = -not $script:Job -and $selected.Count -gt 0
     $Page.DeleteSelected.ToolTip = "Delete or preview $($selected.Count) selected eligible device(s)"
+    if ($Page.ContainsKey('DisableSelected')) {
+        $disable = @(Get-EntraCleanupDisableSelection $Page)
+        $Page.DisableSelected.IsEnabled = -not $script:Job -and $disable.Count -gt 0
+        $Page.DisableSelected.ToolTip = "Disable or preview $($disable.Count) selected enabled device(s)"
+    }
     if ($Page.ContainsKey('SelectAll')) {
         $eligible = @(Get-EntraCleanupEligibleRows $Page)
         $Page.SelectAll.IsEnabled = -not $script:Job -and $eligible.Count -gt $selected.Count
@@ -729,6 +762,19 @@ function Get-EntraCleanupDeletionInvocation {
         Parameters = @{ Action='Delete'; Device=$selected; ExpectedTenantId=$script:ConnectedTenant; AcknowledgeCloudDeletion=$true; SkipGraphConnect=$true; PassThru=$true; WhatIf=$preview; Confirm=$false }
         Preview = $preview
         Summary = "Delete $($selected.Count) selected ${deviceLabel}?"
+    }
+}
+
+function Get-EntraCleanupDisableInvocation {
+    param($Page)
+    $selected = @(Get-EntraCleanupDisableSelection $Page)
+    if (-not $selected.Count -or -not $script:ConnectedTenant) { throw 'Select enabled eligible devices in the currently connected tenant.' }
+    $preview = [bool]$Page.Controls.Preview.IsChecked
+    $deviceLabel = if ($selected.Count -eq 1) { 'device' } else { 'devices' }
+    return @{
+        Parameters = @{ Action='Disable'; Device=$selected; ExpectedTenantId=$script:ConnectedTenant; SkipGraphConnect=$true; PassThru=$true; WhatIf=$preview; Confirm=$false }
+        Preview = $preview
+        Summary = "Disable $($selected.Count) selected ${deviceLabel} in Entra? Users can no longer authenticate with the device until it is re-enabled."
     }
 }
 
@@ -873,7 +919,7 @@ function Start-EntraOperation {
         $queue = [Collections.Concurrent.ConcurrentQueue[object]]::new()
         $state = [hashtable]::Synchronized(@{ Fatal=''; Account=''; Tenant=''; Connected=$null })
         [void]$powershell.AddScript($script:WorkerSource).AddArgument($Page.Path).AddArgument($invocation.Parameters).AddArgument($requirements.Modules).AddArgument($requirements.Scopes).AddArgument($Kind).AddArgument($script:ConnectedTenant).AddArgument($script:RequestedTenant).AddArgument($queue).AddArgument($state)
-        if ($Kind -eq 'Run' -and $invocation.Parameters['Action'] -ne 'Delete') {
+        if ($Kind -eq 'Run' -and $invocation.Parameters['Action'] -notin @('Delete','Disable')) {
             $Page.Results.Clear(); $Page.Filter.Text = ''; $Page.LastOutput = $null
             $Page.OpenOutput.IsEnabled = $false
             Update-EntraResults $Page
@@ -921,7 +967,7 @@ function Receive-EntraOperation {
             $job.Counts.Processed++
             $job.Counts[(Get-EntraOutcomeCategory $result)]++
         }
-        if ($job.Page.Id -eq 'DeviceCleanup' -and $job.Parameters['Action'] -eq 'Delete') {
+        if ($job.Page.Id -eq 'DeviceCleanup' -and $job.Parameters['Action'] -in @('Delete','Disable')) {
             for ($index = 0; $index -lt $job.Page.Results.Count; $index++) {
                 if ($job.Page.Results[$index].ObjectId -eq $result.ObjectId) { $job.Page.Results[$index] = $result; break }
             }
@@ -1143,25 +1189,28 @@ Add-EntraField $attributes 'WhatIf' 'WhatIf preview (no attribute changes)' 'Che
 
 $cleanup = Add-EntraPage -Id 'DeviceCleanup' -Section 'Devices' -Title 'Device Cleanup' -Description 'Device inventory and selected cloud-device cleanup' -RelativePath 'Invoke-EntraDeviceCleanup.ps1' -Scopes @('Device.Read.All','DeviceManagementManagedDevices.Read.All','DeviceManagementServiceConfig.Read.All')
 $cleanup.Run.Content = 'Load devices'
+Add-EntraField $cleanup 'Source' 'Device source' 'Choice' @('CSV file','Entra lookup','Device names') -Tip 'CSV file: devices listed in a CSV. Entra lookup: inactive Windows devices. Device names: exact names typed below.'
 Add-EntraField $cleanup 'CsvPath' 'Device CSV' 'File' -Tip 'Entra group/device export or CSV with DeviceName/displayName, deviceId and/or id/ObjectId.'
+Add-EntraField $cleanup 'InactivityDays' 'Inactive for at least (days)' -Default '90' -Tip 'Lists Windows devices whose latest Entra sign-in or Intune sync is older than this, plus devices with no activity date.'
+Add-EntraField $cleanup 'DeviceNames' 'Device names' 'Lines' -Tip 'One exact device name per line. Every Entra device with a matching name is listed.'
 Add-EntraField $cleanup 'NameFilter' 'Device name contains'
 Add-EntraField $cleanup 'JoinFilter' 'Join type' 'Choice' @('All','Microsoft Entra joined','Microsoft Entra registered','Microsoft Entra hybrid joined','Unknown')
 Add-EntraField $cleanup 'ManagedFilter' 'Intune managed' 'Choice' @('All','Yes','No')
 Add-EntraField $cleanup 'DateFrom' 'Activity from (UTC)' -Tip 'Inclusive date, yyyy-MM-dd.'
 Add-EntraField $cleanup 'DateTo' 'Activity to (UTC)' -Tip 'Inclusive date, yyyy-MM-dd.'
 Add-EntraField $cleanup 'DateMode' 'Activity dates' 'Choice' @('All dates','Known dates','Unknown dates')
-Add-EntraField $cleanup 'Preview' 'Preview only (no deletions)' 'Check'
+Add-EntraField $cleanup 'Preview' 'Preview only (no changes)' 'Check'
 Add-EntraField $cleanup 'Acknowledge' 'I acknowledge explicit deletion of remaining cloud Entra objects' 'Check'
 $cleanup.Controls.Preview.IsChecked = $true
 $cleanup.Table.AutoGenerateColumns = $false
 $cleanup.Table.SelectionMode = 'Extended'
 $cleanup.Table.SelectionUnit = 'FullRow'
-foreach ($name in @('Device Name','Join Type','Intune managed','Activity date','Device ID','Status')) {
+foreach ($name in @('Device Name','Join Type','Enabled','Intune managed','Autopilot','Activity date','Device ID','Status')) {
     $column = [Windows.Controls.DataGridTextColumn]::new(); $column.Header = $name
     $binding = [Windows.Data.Binding]::new($name)
     if ($name -eq 'Activity date') { $binding.StringFormat = 'yyyy-MM-dd HH:mm:ss'; $column.Header = 'Activity date (UTC)' }
-    $column.Binding = $binding; $column.SortMemberPath = $name; $column.MinWidth = 110; $column.MaxWidth = 420
-    $column.Width = [Windows.Controls.DataGridLength]::new($(switch ($name) { 'Device Name' { 180 } 'Join Type' { 210 } 'Activity date' { 180 } 'Device ID' { 270 } 'Status' { 260 } default { 125 } }))
+    $column.Binding = $binding; $column.SortMemberPath = $name; $column.MinWidth = $(if ($name -in @('Enabled','Autopilot')) { 80 } else { 110 }); $column.MaxWidth = 420
+    $column.Width = [Windows.Controls.DataGridLength]::new($(switch ($name) { 'Device Name' { 180 } 'Join Type' { 210 } 'Enabled' { 85 } 'Autopilot' { 90 } 'Activity date' { 180 } 'Device ID' { 270 } 'Status' { 260 } default { 125 } }))
     $textStyle = [Windows.Style]::new([Windows.Controls.TextBlock])
     [void]$textStyle.Setters.Add([Windows.Setter]::new([Windows.FrameworkElement]::MarginProperty,[Windows.Thickness]::new(7,5,7,5)))
     [void]$textStyle.Setters.Add([Windows.Setter]::new([Windows.Controls.TextBlock]::TextTrimmingProperty,[Windows.TextTrimming]::CharacterEllipsis))
@@ -1172,6 +1221,9 @@ foreach ($name in @('Device Name','Join Type','Intune managed','Activity date','
 $cleanup.DeleteSelected = New-EntraButton -Text 'Delete selected' -Tip 'Delete selected eligible cloud devices' -Glyph ([string][char]0xE74D)
 $cleanup.DeleteSelected.IsEnabled = $false; $cleanup.DeleteSelected.Tag = $cleanup
 [void]$cleanup.Actions.Children.Insert(1,$cleanup.DeleteSelected)
+$cleanup.DisableSelected = New-EntraButton -Text 'Disable selected' -Tip 'Disable selected enabled cloud devices in Entra' -Glyph ([string][char]0xE733)
+$cleanup.DisableSelected.IsEnabled = $false; $cleanup.DisableSelected.Tag = $cleanup
+[void]$cleanup.Actions.Children.Insert(1,$cleanup.DisableSelected)
 $cleanup.SelectAll = New-EntraButton -Tip 'Select all visible eligible devices' -Glyph ([string][char]0xE8B3)
 $cleanup.ClearSelection = New-EntraButton -Tip 'Clear selection' -Glyph ([string][char]0xE8E6)
 foreach ($key in @('SelectAll','ClearSelection')) {
@@ -1198,6 +1250,11 @@ $cleanup.ClearSelection.Add_Click({
 $cleanup.DeleteSelected.Add_Click({
     param($sender,$eventArgs)
     try { Start-EntraOperation -Page $sender.Tag -PreparedInvocation (Get-EntraCleanupDeletionInvocation $sender.Tag) }
+    catch { Write-EntraActivity $sender.Tag $_.Exception.Message 'ERROR' }
+})
+$cleanup.DisableSelected.Add_Click({
+    param($sender,$eventArgs)
+    try { Start-EntraOperation -Page $sender.Tag -PreparedInvocation (Get-EntraCleanupDisableInvocation $sender.Tag) }
     catch { Write-EntraActivity $sender.Tag $_.Exception.Message 'ERROR' }
 })
 $cleanup.Table.Tag = $cleanup
