@@ -167,6 +167,7 @@ $lastPage = $ui.Pages | Where-Object { $_.Id -eq 'LastUser' }
 $attributePage = $ui.Pages | Where-Object { $_.Id -eq 'Attributes' }
 $cleanupPage = $ui.Pages | Where-Object { $_.Id -eq 'DeviceCleanup' }
 Assert-EntraTest ($cleanupPage.Table.Columns.Count -eq 8 -and $cleanupPage.Controls.Preview.IsChecked -and -not $cleanupPage.DeleteSelected.IsEnabled -and -not $cleanupPage.DisableSelected.IsEnabled) 'Cleanup columns, preview default and disabled deletion'
+Assert-EntraTest (-not $cleanupPage.Controls.DeleteAutopilotRegistration.IsChecked) 'Cleanup keeps Autopilot registration by default'
 Assert-EntraTest ($cleanupPage.Controls.Source.SelectedItem -eq 'CSV file' -and $cleanupPage.Fields.CsvPath.Visibility -eq 'Visible' -and $cleanupPage.Fields.InactivityDays.Visibility -eq 'Collapsed' -and $cleanupPage.Fields.DeviceNames.Visibility -eq 'Collapsed') 'Cleanup defaults to the CSV source'
 $cleanupPage.Controls.Source.SelectedItem = 'Entra lookup'
 Assert-EntraTest ($cleanupPage.Fields.CsvPath.Visibility -eq 'Collapsed' -and $cleanupPage.Fields.InactivityDays.Visibility -eq 'Visible' -and $cleanupPage.Controls.InactivityDays.Text -eq '90') 'Entra lookup shows inactivity days defaulting to 90'
@@ -895,11 +896,13 @@ try {
         AutopilotDelayPolls=0; AutopilotPolls=0; StickyAutopilotId=''; AutopilotPollFailure=0; PendingAutopilot=@{}
         UsePostDeleteInventory=$false; PostDeleteInventory=@(); PostDeleteEntraMode=''; PostDeleteInventoryStatus=0; PostDeleteMalformedInventory=$false; PostDeletePageFailure=$false; PostDeleteSnapshots=0
         Delays=[Collections.Generic.List[int]]::new(); Events=[Collections.Generic.List[string]]::new(); DelayAction=''; TenantChanged=$false
+        WithoutAutopilotWrite=$false; ChangeTenantAfterIntune=$false
     }
     $cleanupContextProvider = ${function:Get-MgContext}
     function Get-MgContext {
         $context = & $cleanupContextProvider
         if ($cleanupState.TenantChanged) { $context.TenantId = 'different-tenant' }
+        if ($cleanupState.WithoutAutopilotWrite) { $context.Scopes = @($context.Scopes | Where-Object { $_ -ne 'DeviceManagementServiceConfig.ReadWrite.All' }) }
         return $context
     }
     function Start-Sleep {
@@ -930,6 +933,7 @@ try {
             if ($cleanupState.AutoRemoveEntra -and $Uri -like '*windowsAutopilotDeviceIdentities/*') {
                 $cleanupState.Removed['https://graph.microsoft.com/v1.0/devices/' + $cleanupState.Entra.id] = $true
             }
+            if ($cleanupState.ChangeTenantAfterIntune -and $Uri -like '*managedDevices/*') { $cleanupState.TenantChanged = $true }
             return
         }
         if ($Uri -like '*windowsAutopilotDeviceIdentities/*' -and $cleanupState.Writes.Contains($Uri)) {
@@ -1018,7 +1022,19 @@ try {
     $requirements = Get-EntraRequirements $cleanupPage @{ Action='Inspect' }
     Assert-EntraTest ('Directory.AccessAsUser.All' -notin $requirements.Scopes) 'Inspection requests read permissions only'
     $requirements = Get-EntraRequirements $cleanupPage @{ Action='Delete'; WhatIf=$false }
-    Assert-EntraTest ('Directory.AccessAsUser.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -in $requirements.Scopes) 'Deletion requests delegated directory and Intune write permissions'
+    Assert-EntraTest ('Directory.AccessAsUser.All' -in $requirements.Scopes -and 'DeviceManagementManagedDevices.ReadWrite.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.Read.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -notin $requirements.Scopes) 'Keep-mode deletion needs directory and Intune write permissions, but only Autopilot read'
+    $requirements = Get-EntraRequirements $cleanupPage @{ Action='Delete'; WhatIf=$false; DeleteAutopilotRegistration=$true }
+    Assert-EntraTest ('DeviceManagementServiceConfig.ReadWrite.All' -in $requirements.Scopes) 'Selected deregistration adds Autopilot write permission'
+    $requirements = Get-EntraRequirements $cleanupPage @{ Action='Delete'; WhatIf=$true; DeleteAutopilotRegistration=$true }
+    Assert-EntraTest ('Directory.AccessAsUser.All' -notin $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -notin $requirements.Scopes) 'Deregistration preview still needs only read permissions'
+    $cleanupPage.Controls.Preview.IsChecked = $false
+    $requirements = Get-EntraRequirements $cleanupPage @{}
+    Assert-EntraTest ('Directory.AccessAsUser.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -notin $requirements.Scopes) 'Cleanup sign-in reflects the unchecked deregistration option'
+    $cleanupPage.Controls.DeleteAutopilotRegistration.IsChecked = $true
+    $requirements = Get-EntraRequirements $cleanupPage @{}
+    Assert-EntraTest ('DeviceManagementServiceConfig.ReadWrite.All' -in $requirements.Scopes) 'Cleanup sign-in reflects the checked deregistration option'
+    $cleanupPage.Controls.DeleteAutopilotRegistration.IsChecked = $false
+    $cleanupPage.Controls.Preview.IsChecked = $true
     $requirements = Get-EntraRequirements $cleanupPage @{ Action='Disable'; WhatIf=$false }
     Assert-EntraTest ('Directory.AccessAsUser.All' -in $requirements.Scopes -and 'DeviceManagementServiceConfig.ReadWrite.All' -notin $requirements.Scopes) 'Disable requests only the directory write permission'
     $requirements = Get-EntraRequirements $cleanupPage @{ Action='Disable'; WhatIf=$true }
@@ -1071,6 +1087,10 @@ try {
     $cleanupPage.Table.SelectedItem = $cleanupRows[0]
     $deletion = Get-EntraCleanupDeletionInvocation $cleanupPage
     Assert-EntraTest ($deletion.Preview -and $deletion.Parameters.Device.Count -eq 1 -and $cleanupPage.DeleteSelected.IsEnabled) 'Cleanup selected preview captures only eligible same-tenant IDs'
+    $cleanupPage.Controls.DeleteAutopilotRegistration.IsChecked = $true
+    $deregistration = Get-EntraCleanupDeletionInvocation $cleanupPage
+    Assert-EntraTest (-not $deletion.Parameters.DeleteAutopilotRegistration -and $deregistration.Parameters.DeleteAutopilotRegistration -and $deregistration.Summary -like '*Deregister linked Autopilot registrations.*' -and $deregistration.Summary -notlike '*enrollment failures*') 'Deletion captures the chosen mode without changing an already prepared invocation'
+    $cleanupPage.Controls.DeleteAutopilotRegistration.IsChecked = $false
     $disableInvocation = Get-EntraCleanupDisableInvocation $cleanupPage
     Assert-EntraTest ($cleanupPage.DisableSelected.IsEnabled -and $disableInvocation.Preview -and $disableInvocation.Parameters.Action -eq 'Disable' -and $disableInvocation.Parameters.Device.Count -eq 1 -and -not $disableInvocation.Parameters.ContainsKey('AcknowledgeCloudDeletion')) 'Disable selected previews enabled eligible devices without the deletion acknowledgement'
     $cleanupPage.Controls.Preview.IsChecked = $false
@@ -1083,7 +1103,8 @@ try {
     Assert-EntraTest (-not $cleanupPage.DisableSelected.IsEnabled -and $cleanupPage.DeleteSelected.IsEnabled) 'Disable selected ignores devices that are already disabled'
     $cleanupPage.Results.Clear(); [void]$cleanupPage.Results.Add($cleanupRows[0]); Update-EntraResults $cleanupPage
     $cleanupPage.Table.SelectedItem = $cleanupRows[0]
-    Assert-EntraTest ((Get-EntraConfirmationMessage -Page $cleanupPage -Invocation $deletion) -eq 'Delete 1 selected device?') 'Cleanup confirmation shows only the selected-device count'
+    $keepConfirmation = Get-EntraConfirmationMessage -Page $cleanupPage -Invocation $deletion
+    Assert-EntraTest ($keepConfirmation -like 'Delete 1 selected device?*Keep Autopilot registrations.*enrollment failures*' -and $keepConfirmation -notlike '*TEST-CLEANUP*') 'Cleanup confirmation includes the keep-mode warning and count without device names'
     $cleanupPage.Results.Clear()
     foreach ($number in 1..200) {
         $copy = $cleanupRows[0].PSObject.Copy()
@@ -1093,7 +1114,8 @@ try {
     Update-EntraResults $cleanupPage
     $cleanupPage.SelectAll.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
     $bulkDeletion = Get-EntraCleanupDeletionInvocation $cleanupPage
-    Assert-EntraTest ((Get-EntraConfirmationMessage -Page $cleanupPage -Invocation $bulkDeletion) -eq 'Delete 200 selected devices?') 'Bulk cleanup confirmation stays count-only for 200 devices'
+    $bulkConfirmation = Get-EntraConfirmationMessage -Page $cleanupPage -Invocation $bulkDeletion
+    Assert-EntraTest ($bulkConfirmation -like 'Delete 200 selected devices?*Keep Autopilot registrations.*' -and $bulkConfirmation -notlike '*Confirmation device*') 'Bulk cleanup confirmation stays concise and mode-specific for 200 devices'
     Assert-EntraTest ($bulkDeletion.Parameters.Device.Count -eq 200 -and @($bulkDeletion.Parameters.Device.ObjectId | Select-Object -Unique).Count -eq 200 -and $bulkDeletion.Parameters.ExpectedTenantId -eq $script:ConnectedTenant) 'Concise confirmation preserves every selected identity and tenant binding'
     $otherInvocation = @{ Summary='Update selected users.'; Parameters=@{} }
     Assert-EntraTest ((Get-EntraConfirmationMessage -Page $attributePage -Invocation $otherInvocation) -eq "Update selected users.`n`nTenant: $script:ConnectedTenant`nChanges take effect immediately. Continue?") 'Other pages retain their existing confirmation footer'
@@ -1147,8 +1169,34 @@ try {
     Assert-EntraTest $ackRejected 'Cleanup real deletion requires warning acknowledgement'
     $cleanupPage.Controls.Preview.IsChecked = $true
     $deleteArguments = @{ Action='Delete'; Device=$cleanupRows; ExpectedTenantId=$cleanupRows[0].TenantId; AcknowledgeCloudDeletion=$true; SkipGraphConnect=$true; PassThru=$true; Confirm=$false }
+    $keepArguments = $deleteArguments.Clone(); $keepArguments.DeleteAutopilotRegistration = $false
     $previewRows = @(& $cleanupPage.Path @deleteArguments -WhatIf)
-    Assert-EntraTest ($cleanupState.Writes.Count -eq 0 -and $cleanupState.Delays.Count -eq 0 -and $previewRows[0].Status -like 'Preview*') 'Cleanup WhatIf does not delete or delay'
+    $keepPreview = @(& $cleanupPage.Path @keepArguments -WhatIf 3>$null)
+    Assert-EntraTest ($cleanupState.Writes.Count -eq 0 -and $cleanupState.Delays.Count -eq 0 -and $previewRows[0].Status -like 'Preview*deregister*' -and $keepPreview[0].Status -like 'Preview*keep registration*') 'CLI deregisters Autopilot by default; explicit false previews keep mode, without writes or delay'
+    $cleanupState.WithoutAutopilotWrite = $true; $cleanupState.Events.Clear()
+    try {
+        $keepWarnings = @()
+        $keptRows = @(& $cleanupPage.Path @keepArguments -WarningVariable keepWarnings 3>$null)
+        $keepEvents = @($cleanupState.Events | Where-Object { $_ -like 'DELETE:*' -or $_ -like 'Delay:*' })
+        Assert-EntraTest (($keepEvents -join ',') -eq 'DELETE:managed-cleanup,DELETE:cccccccc-1111-1111-1111-111111111111' -and $cleanupState.Delays.Count -eq 0 -and $keptRows[0].Status -eq 'Entra removed; Autopilot registration kept' -and -not $keptRows[0].AutopilotRemovalRequested -and $keptRows[0].Autopilot -eq 'Yes' -and -not $keptRows[0].CanDelete) 'CLI keep mode deletes Intune then Entra without deregistration, delay or Autopilot write permission'
+        Assert-EntraTest (($keepWarnings -join ' ') -like '*enrollment failures*' -and (Get-EntraOutcomeCategory $keptRows[0]) -eq 'Success') 'Keep mode warns about enrollment risk and reports confirmed Entra removal as success'
+        $cleanupState.Writes.Clear(); $cleanupState.Removed.Clear()
+        $permissionRejected = $false
+        try { & $cleanupPage.Path @deleteArguments | Out-Null } catch { $permissionRejected = $_.Exception.Message -like '*lacks the required scopes*' }
+        Assert-EntraTest ($permissionRejected -and $cleanupState.Writes.Count -eq 0) 'Default CLI deregistration requires Autopilot write permission before any deletion'
+    } finally { $cleanupState.WithoutAutopilotWrite = $false }
+    $cleanupState.FailStage = $cleanupState.Entra.id; $cleanupState.Events.Clear()
+    $keepFailedRows = @(& $cleanupPage.Path @keepArguments 3>$null)
+    Assert-EntraTest ($keepFailedRows[0].Status -like 'Failed:*' -and $cleanupState.Writes.Count -eq 1 -and @($cleanupState.Events | Where-Object { $_ -like 'DELETE:autopilot-*' }).Count -eq 0 -and $cleanupState.Delays.Count -eq 0) 'Keep-mode Entra rejection is a failure, with no fallback Autopilot deregistration'
+    $cleanupState.FailStage = ''; $cleanupState.Writes.Clear(); $cleanupState.Removed.Clear(); $cleanupState.Sticky = $true
+    $keepPendingRows = @(& $cleanupPage.Path @keepArguments -RemovalTimeoutSeconds 1 3>$null)
+    Assert-EntraTest ($keepPendingRows[0].Status -like 'Pending confirmation:*Intune*' -and -not $keepPendingRows[0].CanDelete -and $cleanupState.Writes.Count -eq 1) 'Keep mode still blocks Entra deletion when Intune removal is unconfirmed'
+    $cleanupState.Sticky = $false; $cleanupState.Writes.Clear(); $cleanupState.Removed.Clear(); $cleanupState.ChangeTenantAfterIntune = $true
+    try {
+        $keepChangedRows = @(& $cleanupPage.Path @keepArguments 3>$null)
+        Assert-EntraTest ($keepChangedRows[0].Status -like 'Failed:*tenant changed*' -and $cleanupState.Writes.Count -eq 1) 'Keep mode rechecks the tenant before deleting Entra'
+    } finally { $cleanupState.ChangeTenantAfterIntune = $false; $cleanupState.TenantChanged = $false }
+    $cleanupState.Writes.Clear(); $cleanupState.Removed.Clear(); $cleanupState.Events.Clear()
     $cleanupState.AutopilotFailures = 4; $beforeRequests = $cleanupState.AutopilotRequests
     $autopilotRejected = $false
     try { & $cleanupPage.Path @deleteArguments | Out-Null } catch { $autopilotRejected = $true }

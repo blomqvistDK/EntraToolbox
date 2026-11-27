@@ -13,13 +13,19 @@
     semicolon delimiters. Group exports are restricted to objectType=device rows.
     Activity is the latest Entra approximate sign-in or linked Intune sync (UTC).
     Disable sets the Entra device accountEnabled to false and touches nothing else.
-    Deletion removes Intune, then Autopilot, then any remaining Entra object.
+    Deletion removes Intune, then Autopilot (by default), then any remaining Entra
+    object. -DeleteAutopilotRegistration:$false keeps Autopilot registration.
+    Keeping registration while deleting its Entra object can cause future
+    Windows Autopilot enrollment failures.
     Hybrid and unknown join types are blocked. No wipe or on-premises AD action.
     Delegated disable/deletion requires Directory.AccessAsUser.All and appropriate
     administrator roles; deletion also needs Intune write scopes and an explicit
     cloud-deletion acknowledgement.
-    After all Autopilot deletion requests are accepted, waits ten seconds once
+    When deregistration is selected and all Autopilot deletion requests are accepted, waits ten seconds once
     per device before rechecking Entra. Autopilot completion is not verified.
+.PARAMETER DeleteAutopilotRegistration
+    Deregister linked Windows Autopilot registrations before Entra deletion.
+    Defaults to $true. Use -DeleteAutopilotRegistration:$false to keep registration.
 .PARAMETER InactivityDays
     Entra source only: minimum days without activity; defaults to 90.
 .PARAMETER RemovalTimeoutSeconds
@@ -32,6 +38,8 @@
 .EXAMPLE
     $devices = .\Invoke-EntraDeviceCleanup.ps1 -CsvPath .\devices.csv -PassThru
     .\Invoke-EntraDeviceCleanup.ps1 -Action Delete -Device $devices[0] -ExpectedTenantId $devices[0].TenantId -AcknowledgeCloudDeletion -WhatIf
+.EXAMPLE
+    .\Invoke-EntraDeviceCleanup.ps1 -Action Delete -Device $devices[0] -ExpectedTenantId $devices[0].TenantId -AcknowledgeCloudDeletion -DeleteAutopilotRegistration:$false -WhatIf
 .EXAMPLE
     $stale = .\Invoke-EntraDeviceCleanup.ps1 -Source Entra -InactivityDays 120 -PassThru
     .\Invoke-EntraDeviceCleanup.ps1 -Action Disable -Device $stale -ExpectedTenantId $stale[0].TenantId -WhatIf
@@ -48,6 +56,7 @@ param(
     [object[]]$Device,
     [string]$ExpectedTenantId,
     [switch]$AcknowledgeCloudDeletion,
+    [bool]$DeleteAutopilotRegistration = $true,
     [switch]$SkipGraphConnect,
     [switch]$PassThru,
     [ValidateRange(1,600)][int]$RemovalTimeoutSeconds = 60,
@@ -231,11 +240,12 @@ function Wait-CleanupRemoval {
 }
 
 function Remove-CleanupDeviceRecords {
-    param($Row, [string]$Tenant, [int]$TimeoutSeconds)
+    param($Row, [string]$Tenant, [int]$TimeoutSeconds, [switch]$DeleteAutopilotRegistration)
     foreach ($stage in @(
         @{ Name='Intune'; Collection='managedDevices'; Ids=@($Row.ManagedDeviceIds) },
         @{ Name='Autopilot'; Collection='windowsAutopilotDeviceIdentities'; Ids=@($Row.AutopilotIds) }
     )) {
+        if ($stage.Name -eq 'Autopilot' -and -not $DeleteAutopilotRegistration) { continue }
         foreach ($recordId in $stage.Ids) {
             if (-not $recordId) { throw "Missing $($stage.Name) record ID." }
             if ((Get-MgContext).TenantId -ne $Tenant) { throw 'Graph tenant changed; deletion stopped.' }
@@ -294,7 +304,8 @@ if (-not @($targets).Count -and -not ($Action -eq 'Inspect' -and $Source -eq 'En
 if (-not $SkipGraphConnect) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
 $scopes = @('Device.Read.All','DeviceManagementManagedDevices.Read.All','DeviceManagementServiceConfig.Read.All')
 if ($Action -eq 'Delete' -and -not $WhatIfPreference) {
-    $scopes += @('Directory.AccessAsUser.All','DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementServiceConfig.ReadWrite.All')
+    $scopes += @('Directory.AccessAsUser.All','DeviceManagementManagedDevices.ReadWrite.All')
+    if ($DeleteAutopilotRegistration) { $scopes += 'DeviceManagementServiceConfig.ReadWrite.All' }
 }
 if ($Action -eq 'Disable' -and -not $WhatIfPreference) { $scopes += 'Directory.AccessAsUser.All' }
 $context = Get-MgContext
@@ -338,12 +349,21 @@ foreach ($target in $targets) {
             if ($staleCutoff -and $null -ne $row.'Activity date' -and $row.'Activity date' -ge $staleCutoff) { $row = $null; continue }
             if ($Action -eq 'Delete') {
                 if (-not $row.CanDelete) { throw $row.Status }
-                if ($PSCmdlet.ShouldProcess("$tenant / $($row.'Device Name') / $($row.ObjectId)", 'Delete Intune records, deregister Autopilot and delete remaining cloud Entra device')) {
+                $autopilotAction = if ($DeleteAutopilotRegistration) { 'deregister' } else { 'keep registration' }
+                $deletionAction = if ($DeleteAutopilotRegistration) { 'Delete Intune records, deregister Autopilot and delete remaining cloud Entra device' }
+                    else { 'Delete Intune records and remaining cloud Entra device; keep Autopilot registration' }
+                if (-not $DeleteAutopilotRegistration -and $row.AutopilotIds.Count) {
+                    Write-Warning "$($row.'Device Name'): keeping Autopilot registration while deleting its Entra object can cause future Windows Autopilot enrollment failures."
+                }
+                if ($PSCmdlet.ShouldProcess("$tenant / $($row.'Device Name') / $($row.ObjectId)", $deletionAction)) {
                     $row.Status = 'Cleanup started'
-                    Remove-CleanupDeviceRecords -Row $row -Tenant $tenant -TimeoutSeconds $RemovalTimeoutSeconds
-                    $row.Status = if ($row.AutopilotRemovalRequested) { 'Entra removed; Autopilot removal requested' } else { 'Deleted' }
+                    Write-Information "$($row.'Device Name'): Autopilot: $autopilotAction."
+                    Remove-CleanupDeviceRecords -Row $row -Tenant $tenant -TimeoutSeconds $RemovalTimeoutSeconds -DeleteAutopilotRegistration:$DeleteAutopilotRegistration
+                    $row.Status = if ($row.AutopilotRemovalRequested) { 'Entra removed; Autopilot removal requested' }
+                        elseif (-not $DeleteAutopilotRegistration -and $row.AutopilotIds.Count) { 'Entra removed; Autopilot registration kept' }
+                        else { 'Deleted' }
                     $row.CanDelete = $false; $row.'Intune managed' = 'No'
-                } else { $row.Status = 'Preview; no changes' }
+                } else { $row.Status = "Preview; no changes; Autopilot: $autopilotAction" }
             } elseif ($Action -eq 'Disable') {
                 if (-not $row.CanDelete) { throw $row.Status }
                 if ($row.Enabled -eq 'No') { $row.Status = 'Already disabled' }

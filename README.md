@@ -178,6 +178,8 @@ Use `-CsvPath` instead of device names for CSV input. `-GroupNameOrId` accepts a
 ```powershell
 $devices = .\Features\Invoke-EntraDeviceCleanup.ps1 -CsvPath 'C:\Inputs\devices.csv' -PassThru
 .\Features\Invoke-EntraDeviceCleanup.ps1 -Action Delete -Device $devices[0] -ExpectedTenantId $devices[0].TenantId -AcknowledgeCloudDeletion -WhatIf -PassThru
+# Keep Autopilot registration while deleting Intune and Entra records
+.\Features\Invoke-EntraDeviceCleanup.ps1 -Action Delete -Device $devices[0] -ExpectedTenantId $devices[0].TenantId -AcknowledgeCloudDeletion -DeleteAutopilotRegistration:$false -WhatIf -PassThru
 
 # Stale Windows devices straight from Entra, or exact device names
 $stale = .\Features\Invoke-EntraDeviceCleanup.ps1 -Source Entra -InactivityDays 90 -PassThru
@@ -185,7 +187,18 @@ $named = .\Features\Invoke-EntraDeviceCleanup.ps1 -Source Names -DeviceName 'PC-
 .\Features\Invoke-EntraDeviceCleanup.ps1 -Action Disable -Device $stale -ExpectedTenantId $stale[0].TenantId -WhatIf -PassThru
 ```
 
-The first command inspects devices. The second previews deletion for one inspected device. Before a real deletion, verify eligibility, tenant, administrator roles and required deletion scopes. `-SkipGraphConnect` can reuse a suitably consented session. Remove `-WhatIf` only for an intentional deletion; normal confirmation remains supported.
+The first command inspects devices. The second previews deletion for one inspected device, including Autopilot deregistration. The third keeps Autopilot registration. Before a real deletion, verify eligibility, tenant, administrator roles and required deletion scopes. `-SkipGraphConnect` can reuse a suitably consented session. Remove `-WhatIf` only for an intentional deletion; normal confirmation remains supported.
+
+**Delete Autopilot registration** is unchecked by default in the GUI. The CLI parameter `-DeleteAutopilotRegistration` defaults to `$true`, preserving the previous script behavior:
+
+- **Unchecked / `-DeleteAutopilotRegistration:$false`:** delete and confirm linked Intune records, then delete and confirm the remaining Entra object. Autopilot deregistration requests and the ten-second handoff delay are skipped.
+- **Checked / CLI default:** delete and confirm Intune records, request deregistration of linked Autopilot registrations, wait ten seconds once after accepted requests, then delete and confirm any remaining Entra object. Autopilot deregistration completion is not verified.
+
+Intune cleanup is unchanged in both modes.
+
+**Warning:** [Windows Autopilot depends on its associated Entra object](https://learn.microsoft.com/en-us/autopilot/registration-overview). Deleting that object while keeping registration can cause future enrollment failures. The confirmation and Activity warn when keeping linked registrations; keeping registration is not a guarantee of successful redeployment. Entra deletion errors are reported without falling back to Autopilot deregistration.
+
+Both modes still read Intune and Autopilot inventory and validate linkage. Real deletion requires `Directory.AccessAsUser.All` and `DeviceManagementManagedDevices.ReadWrite.All`; `DeviceManagementServiceConfig.ReadWrite.All` is additionally required only when deregistration is selected. The inventory read scopes remain required in both modes, and preview uses read permissions only.
 
 Device sources (GUI **Device source** / `-Source`):
 
@@ -195,7 +208,7 @@ Device sources (GUI **Device source** / `-Source`):
 
 **Disable selected** (`-Action Disable`) only sets the Entra device `accountEnabled` to false, then re-reads the device to confirm it. Intune and Autopilot records are untouched, already-disabled devices are skipped, and hybrid or unknown join types are blocked. It honours **Preview only**, asks for tenant confirmation, and needs `Directory.AccessAsUser.All` plus Cloud Device Administrator (or higher); the deletion acknowledgement is not required. Deletion does not require the device to be disabled first. A common flow is to load stale devices, disable them, and delete them after a grace period.
 
-Cleanup retains its existing Intune, Autopilot, and remaining Entra deletion sequence, verification rules, hybrid-device restrictions, and cloud-deletion acknowledgement. It does not wipe devices or delete on-premises AD objects. The GUI retains preview-by-default, selection filtering, acknowledgement, tenant checks, and confirmation safeguards.
+Cleanup retains its verification rules, hybrid-device restrictions, and cloud-deletion acknowledgement. Selecting Autopilot deregistration preserves the former three-stage deletion sequence. It does not wipe devices or delete on-premises AD objects. The GUI retains preview-by-default, selection filtering, acknowledgement, tenant checks, and confirmation safeguards.
 
 ## Offline Validation
 

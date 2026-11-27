@@ -648,7 +648,10 @@ function Get-EntraRequirements {
     $scopes = @($Page.Scopes)
     if ($Page.Id -eq 'DeviceCleanup' -and (($Parameters['Action'] -eq 'Delete' -and -not $Parameters['WhatIf']) -or
         ($Parameters.Count -eq 0 -and -not $Page.Controls.Preview.IsChecked))) {
-        $scopes += @('Directory.AccessAsUser.All','DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementServiceConfig.ReadWrite.All')
+        $scopes += @('Directory.AccessAsUser.All','DeviceManagementManagedDevices.ReadWrite.All')
+        if ($Parameters['DeleteAutopilotRegistration'] -or ($Parameters.Count -eq 0 -and $Page.Controls.DeleteAutopilotRegistration.IsChecked)) {
+            $scopes += 'DeviceManagementServiceConfig.ReadWrite.All'
+        }
     }
     if ($Page.Id -eq 'DeviceCleanup' -and $Parameters['Action'] -eq 'Disable' -and -not $Parameters['WhatIf']) { $scopes += 'Directory.AccessAsUser.All' }
     if ($Page.Id -eq 'Members') {
@@ -757,11 +760,17 @@ function Get-EntraCleanupDeletionInvocation {
     if (-not $selected.Count -or -not $script:ConnectedTenant) { throw 'Select eligible devices in the currently connected tenant.' }
     $preview = [bool]$Page.Controls.Preview.IsChecked
     if (-not $preview -and -not $Page.Controls.Acknowledge.IsChecked) { throw 'Acknowledge remaining cloud Entra deletion before deleting.' }
+    $deleteAutopilot = [bool]$Page.Controls.DeleteAutopilotRegistration.IsChecked
     $deviceLabel = if ($selected.Count -eq 1) { 'device' } else { 'devices' }
+    $autopilotAction = if ($deleteAutopilot) { 'Deregister linked Autopilot registrations.' } else { 'Keep Autopilot registrations.' }
+    $summary = "Delete $($selected.Count) selected ${deviceLabel}?`n`n$autopilotAction"
+    if (-not $deleteAutopilot -and @($selected | Where-Object { $_.AutopilotIds.Count }).Count) {
+        $summary += "`nWarning: keeping Autopilot registration while deleting its Entra object can cause future Windows Autopilot enrollment failures."
+    }
     return @{
-        Parameters = @{ Action='Delete'; Device=$selected; ExpectedTenantId=$script:ConnectedTenant; AcknowledgeCloudDeletion=$true; SkipGraphConnect=$true; PassThru=$true; WhatIf=$preview; Confirm=$false }
+        Parameters = @{ Action='Delete'; Device=$selected; ExpectedTenantId=$script:ConnectedTenant; AcknowledgeCloudDeletion=$true; DeleteAutopilotRegistration=$deleteAutopilot; SkipGraphConnect=$true; PassThru=$true; WhatIf=$preview; Confirm=$false }
         Preview = $preview
-        Summary = "Delete $($selected.Count) selected ${deviceLabel}?"
+        Summary = $summary
     }
 }
 
@@ -1200,6 +1209,7 @@ Add-EntraField $cleanup 'DateFrom' 'Activity from (UTC)' -Tip 'Inclusive date, y
 Add-EntraField $cleanup 'DateTo' 'Activity to (UTC)' -Tip 'Inclusive date, yyyy-MM-dd.'
 Add-EntraField $cleanup 'DateMode' 'Activity dates' 'Choice' @('All dates','Known dates','Unknown dates')
 Add-EntraField $cleanup 'Preview' 'Preview only (no changes)' 'Check'
+Add-EntraField $cleanup 'DeleteAutopilotRegistration' 'Delete Autopilot registration' 'Check' -Tip 'Unchecked keeps Autopilot registration, but still deletes linked Intune records and the Entra object. Deleting its Entra object can cause future Windows Autopilot enrollment failures.'
 Add-EntraField $cleanup 'Acknowledge' 'I acknowledge explicit deletion of remaining cloud Entra objects' 'Check'
 $cleanup.Controls.Preview.IsChecked = $true
 $cleanup.Table.AutoGenerateColumns = $false
